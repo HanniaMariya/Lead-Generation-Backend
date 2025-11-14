@@ -1,11 +1,13 @@
 fastapi
 uvicorn
+apscheduler
 psycopg2-binary
 beautifulsoup4
 python-dotenv
 pydantic
 lxml
 playwright
+asyncio
 
 httpx
 pytest
@@ -14,6 +16,7 @@ aiohttp
 crawl4ai
 datetime
 typing
-psycopg2-binary
+python-dateutil
+kafka-python
 
 

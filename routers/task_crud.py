@@ -1,23 +1,29 @@
 from fastapi import HTTPException
-from models import TaskInfo,TaskRequest,TasksListResponse, TaskUpdateRequest, PreviewMappingRequest
+from models import TaskInfo,TaskRequest,TasksListResponse, TaskUpdateRequest, PreviewMappingRequest, PaginationConfig
 from fastapi import APIRouter
-from routers.get_db_connection import get_db_cursor
 from datetime import datetime
+from routers.get_db_connection import get_db_cursor
 from crawl4Util import extract_website
 from scraping_router import route_scraping_request 
 from models import ScrapeRequest
 from psycopg2 import sql
-from asyncio import WindowsProactorEventLoopPolicy 
-import sys
-import asyncio
 from datetime import datetime, timezone
-import httpx
-from psycopg2.extras import RealDictCursor
+import os
+import psycopg2
 from routers.scheduler_config import scheduler, enqueue_and_reschedule
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 VALID_REPEATS = {"once", "daily", "weekly", "monthly", "yearly"}
-
+# DATABASE_URL = os.getenv("DATABASE_URL","postgresql://postgres:9042c98a@host.docker.internal:5432/LeadGenerationPro")
+# DATABASE_URL = os.getenv("DATABASE_URL","postgresql://postgres:9042c98a@localhost:5432/LeadGenerationPro")
 router = APIRouter()
+
+# def get_db_cursor_docker():
+#     connection = psycopg2.connect(DATABASE_URL)
+#     return connection, connection.cursor()
 
 @router.post("/create-task", response_model=dict)
 async def create_task(request: TaskRequest):
@@ -108,7 +114,7 @@ async def create_task(request: TaskRequest):
         }
         
     except HTTPException:
-        conn.rollback()
+        # conn.rollback()
         raise
     except Exception as e:
         # conn.rollback()
@@ -294,10 +300,11 @@ async def update_task(task_id: int, request: TaskUpdateRequest):
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to update task: {str(e)}")
     
-async def upsert_entity_record(cur, entity_name: str, source_name: str, item: dict):
+async def upsert_entity_record(cur,entity_name: str, source_name: str, item: dict):
     """
     Upsert row on (source, name).
     """
+   
     name_val = item.get("name")  # adjust if column is named differently
 
     # Ensure source & modified_at are present
@@ -306,7 +313,7 @@ async def upsert_entity_record(cur, entity_name: str, source_name: str, item: di
 
     columns = list(item.keys())
     values = list(item.values())
-
+    logger.debug("Reached upsert stage for entity=%s, name=%s", entity_name, item.get('name'))
     insert_stmt = sql.SQL("""
         INSERT INTO {} ({})
         VALUES ({})
@@ -321,9 +328,13 @@ async def upsert_entity_record(cur, entity_name: str, source_name: str, item: di
             for col in columns if col not in ("source", "name", "modified_at")
         )
     )
-
-
-    cur.execute(insert_stmt, values)
+    try:
+        cur.execute(insert_stmt, values)
+        logger.debug("Upsert executed for entity=%s name=%s", entity_name, item.get('name'))
+    except Exception as e:
+        logger.exception("Upsert failed for entity=%s name=%s: %s", entity_name, item.get('name'), e)
+        # re-raise so caller can handle/skip this row
+        raise
 
 @router.post("/execute-task/{task_id}")
 async def execute_task(task_id: int):
@@ -340,6 +351,7 @@ async def execute_task(task_id: int):
                 t.source_id,
                 s.name as source_name,
                 s.url as source_url,
+                s.pagination_config,
                 t.mapping_id,
                 t.repeat,
                 t.max_items,
@@ -357,21 +369,27 @@ async def execute_task(task_id: int):
         if not task_data:
             raise HTTPException(status_code=404, detail="Task not found")
         
-        # Extract task information
-        (task_id_db, task_name, source_id, source_name, source_url, 
-         mapping_id, repeat, max_items, mapping_name, entity_name, container_selector, field_mappings) = task_data
         
+        # Extract task information
+        (task_id_db, task_name, source_id, source_name, source_url, pagination_config,
+         mapping_id, repeat, max_items, mapping_name, entity_name, container_selector, field_mappings) = task_data
+
         # Build ScrapeRequest from task data
         scrape_request = ScrapeRequest(
             entity_name=entity_name,
             url=source_url,
+            pagination_config=pagination_config,
             container_selector=container_selector,
             field_mappings=field_mappings,
-            max_items=max_items,  
-            timeout=30  # Increased timeout for better reliability
+            max_items=max_items,
+            timeout=500
         )
         
         # Execute scraping using the dynamic scraper (now properly async)
+        # scrape_response = await asyncio.wait_for(
+            #     route_scraping_request(scrape_request), 
+            #     timeout=120.0
+            # )
         scrape_response = await route_scraping_request(scrape_request)
         
         if not scrape_response.success or not scrape_response.data:
@@ -402,11 +420,12 @@ async def execute_task(task_id: int):
             )
         
         # Insert / Update scraped data in the entity table
+        print("Starting to upsert scraped data...\n")
         items_stored = 0
         for item in scrape_response.data:
             insert_data = {col: item.get(col) for col in table_columns.keys()}
             try:
-                await upsert_entity_record(cur, entity_name, source_name, insert_data)
+                await upsert_entity_record(cur,entity_name, source_name, insert_data)
                 items_stored += 1
             except Exception as e:
                 print(f"Error upserting row: {e}")
@@ -420,14 +439,6 @@ async def execute_task(task_id: int):
         """, (datetime.now(), task_id))
 
         conn.commit()
-
-        # # For once-only tasks, remove job after execution        
-        # job_id = str(task_id)
-        # job = scheduler.get_job(job_id)
-        # if repeat == "once" and job:
-        #     scheduler.remove_job(job_id)
-        #     print(f"Removed once-only job {job_id} after execution")
-
         
         return {
             "success": True,
