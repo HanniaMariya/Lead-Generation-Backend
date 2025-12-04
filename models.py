@@ -33,12 +33,20 @@ class PaginationConfig(BaseModel):
     # for path
     path_pattern: Optional[str] = None
 
-    # for button click or ajax
+    # for button click or ajax or scroll (with wait)
     button_selector: Optional[str] = None
     wait_selector: Optional[str] = None
 
     # for scroll
     scroll_steps: Optional[int] = None
+    click_steps: Optional[int] = None
+
+class CaptchaParams(BaseModel):
+    api_key: Optional[str] = None
+    site_url: str
+    captcha_type: Optional[str] = None  # e.g., "recaptcha_v2", "recaptcha_v3", "turnstile", etc.
+    site_key: Optional[str] = None
+    
 class ScrapeRequest(BaseModel):
     entity_name: str
     url: HttpUrl
@@ -47,6 +55,7 @@ class ScrapeRequest(BaseModel):
     max_items: Optional[int] = 10
     timeout: Optional[int] = 15
     pagination_config: Optional[PaginationConfig] = None
+    captcha_params: Optional[CaptchaParams] = None
 
 class ScrapeResponse(BaseModel):
     entity_name: str
@@ -60,6 +69,7 @@ class ScrapeResponse(BaseModel):
 class Attribute(BaseModel):
     name: str
     datatype: str   # e.g. "text", "int", "bool"
+    check_for_unique: Optional[bool] = False
 
 class EntityRequest(BaseModel):
     name: str   # table name
@@ -92,7 +102,7 @@ class MappingsListResponse(BaseModel):
     mappings: List[MappingInfo]
 
 class PaginationConfig(BaseModel):
-    type: str  # "query_param" | "offset" | "path" | "button_click" | "scroll" | "ajax_click"
+    type: str  # "query_param" | "offset" | "path" | "button_click" | "scroll" 
     param_name: Optional[str] = "page"  # for query or offset
     start_page: Optional[int] = 1
     page_size: Optional[int] = None   # for offset
@@ -107,11 +117,16 @@ class PaginationConfig(BaseModel):
 
     # for scroll
     scroll_steps: Optional[int] = None
+    click_steps: Optional[int] = None
+
+
 class SourceInfo(BaseModel):
     id: int
     name: str
     url: str
     pagination_config: Optional[PaginationConfig] = None
+    is_captcha_protected: bool = False
+    captcha_params: Optional[CaptchaParams] = None
 
 class SourcesListResponse(BaseModel):
     total_sources: int
@@ -161,3 +176,31 @@ class PreviewMappingRequest(BaseModel):
     entity_name: str
     container_selector: Optional[str] = None
     field_mappings: Dict[str, FieldMapping]
+    
+class MessageRequest(BaseModel):
+    text: str
+
+class MessageResponse(BaseModel):
+    id: int
+    sender: str
+    text: str
+    timestamp: str
+
+class QuickExtractRequest(BaseModel):
+    """Request model for quick extraction without entity requirement."""
+    url: HttpUrl
+    container_selector: Optional[str] = None
+    field_mappings: Dict[str, FieldMapping]
+    max_items: Optional[int] = None
+    timeout: Optional[int] = 15
+    pagination_config: Optional[PaginationConfig] = None
+    captcha_params: Optional[CaptchaParams] = None
+
+class QuickExtractResponse(BaseModel):
+    """Response model for quick extraction."""
+    url: str
+    scraped_at: datetime
+    total_items: int
+    data: List[Dict[str, Any]]
+    success: bool
+    message: str

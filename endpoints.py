@@ -8,12 +8,13 @@ from fastapi.responses import HTMLResponse
 from fastapi import FastAPI, HTTPException
 from datetime import datetime
 import asyncio
-from models import SourceInfo, SourcesListResponse, FieldMapping, ScrapeRequest, ScrapeResponse, EntityRequest, EntityMappingRequest, EntityInfo, EntitiesListResponse, Attribute, MappingsListResponse, MappingInfo, MappingFormRequest, TaskInfo,TaskRequest,TasksListResponse, TaskUpdateRequest, FetchContentRequest
+from models import SourceInfo, SourcesListResponse, FieldMapping, ScrapeRequest, ScrapeResponse, EntityRequest, EntityMappingRequest, EntityInfo, EntitiesListResponse, Attribute, MappingsListResponse, MappingInfo, MappingFormRequest, TaskInfo,TaskRequest,TasksListResponse, TaskUpdateRequest, FetchContentRequest, QuickExtractRequest, QuickExtractResponse
 from utils import extract_value, fetch_page
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 from crawl4Util import extract_website
-from routers import entity_crud, source_crud, entity_mappings_crud, task_crud
+from scraping_router import route_scraping_request
+from routers import entity_crud, source_crud, entity_mappings_crud, task_crud, chat_crud
 from routers.scheduler_config import scheduler, task_lifespan
 
 # Setup logging
@@ -32,6 +33,7 @@ app.include_router(entity_crud.router, prefix="/entity", tags=["Entity Managemen
 app.include_router(source_crud.router, prefix="/source", tags=["Source Management"])
 app.include_router(entity_mappings_crud.router, prefix="/mapping", tags=["Entity Mappings Management"])
 app.include_router(task_crud.router, prefix="/task", tags=["Task Management"])
+app.include_router(chat_crud.router, prefix="/chat", tags=["Chat Management"])
 
 # CORS middleware
 app.add_middleware(
@@ -53,10 +55,11 @@ async def fetch_content(request: FetchContentRequest):
 @app.post("/scrapedynamic", response_model=ScrapeResponse)
 async def scrape_dynamic(request: ScrapeRequest):
     """
-    Async version of dynamic scraping to avoid blocking
+    Async version of dynamic scraping to avoid blocking.
+    Routes requests intelligently (Google Maps vs CSS scraper).
     """
     try:
-        response = await extract_website(request)
+        response = await route_scraping_request(request)
         return response
     except Exception as e:
         logger.error("Error during dynamic scraping", exc_info=True)
@@ -148,6 +151,89 @@ async def scrape_website(request: ScrapeRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Scraping failed: {str(e)}")
+
+@app.post("/quick-extract", response_model=QuickExtractResponse)
+async def quick_extract(request: QuickExtractRequest):
+    """
+    Quick extraction endpoint that doesn't require entity_name and doesn't save to database.
+    Perfect for one-off scraping tasks.
+    """
+    try:
+        # Convert QuickExtractRequest to ScrapeRequest format for existing scraping logic
+        # Use a dummy entity_name since it's required by ScrapeRequest but won't be saved
+        scrape_request = ScrapeRequest(
+            entity_name="quick_extract",  # Dummy name, not used
+            url=request.url,
+            container_selector=request.container_selector,
+            field_mappings=request.field_mappings,
+            max_items=request.max_items,
+            timeout=request.timeout,
+            pagination_config=request.pagination_config,
+            captcha_params=request.captcha_params
+        )
+        
+        # Use existing routing logic
+        scrape_response = await route_scraping_request(scrape_request)
+        
+        # Convert ScrapeResponse to QuickExtractResponse (remove entity_name)
+        return QuickExtractResponse(
+            url=scrape_response.url,
+            scraped_at=scrape_response.scraped_at,
+            total_items=scrape_response.total_items,
+            data=scrape_response.data,
+            success=scrape_response.success,
+            message=scrape_response.message
+        )
+    except Exception as e:
+        logger.error("Error during quick extraction", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Quick extraction error: {e}")
+
+@app.post("/quick-extract/preview", response_model=QuickExtractResponse)
+async def quick_extract_preview(request: QuickExtractRequest):
+    """
+    Preview endpoint for quick extraction - returns first 5 items for testing.
+    """
+    try:
+        # Limit to 5 items for preview
+        preview_request = QuickExtractRequest(
+            url=request.url,
+            container_selector=request.container_selector,
+            field_mappings=request.field_mappings,
+            max_items=5,  # Limit preview to 5 items
+            timeout=request.timeout,
+            pagination_config=request.pagination_config,
+            captcha_params=request.captcha_params
+        )
+        
+        # Convert to ScrapeRequest
+        scrape_request = ScrapeRequest(
+            entity_name="quick_extract_preview",
+            url=preview_request.url,
+            container_selector=preview_request.container_selector,
+            field_mappings=preview_request.field_mappings,
+            max_items=preview_request.max_items,
+            timeout=preview_request.timeout,
+            pagination_config=preview_request.pagination_config,
+            captcha_params=preview_request.captcha_params
+        )
+        
+        # Use existing routing logic
+        scrape_response = await route_scraping_request(scrape_request)
+        
+        # Limit to first 5 items for preview
+        preview_data = scrape_response.data[:5] if scrape_response.data else []
+        
+        return QuickExtractResponse(
+            url=scrape_response.url,
+            scraped_at=scrape_response.scraped_at,
+            total_items=scrape_response.total_items,
+            data=preview_data,
+            success=scrape_response.success,
+            message=f"Preview successful - showing first {len(preview_data)} items" if scrape_response.success else scrape_response.message
+        )
+    except Exception as e:
+        logger.error("Error during quick extract preview", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Quick extract preview error: {e}")
 
     
 @app.get("/")
