@@ -1,9 +1,9 @@
 from fastapi import HTTPException
-from models import TaskInfo,TaskRequest,TasksListResponse, SourceInfo, TaskUpdateRequest, PreviewMappingRequest, PaginationConfig, CaptchaParams
+from models import TaskInfo,TaskRequest,TasksListResponse, SourceInfo, TaskUpdateRequest, PreviewMappingRequest, PaginationConfig, CaptchaParams, FollowLink, FieldMapping
 from fastapi import APIRouter
 from datetime import datetime
 from routers.get_db_connection import get_db_cursor
-from crawl4Util import extract_website
+from helperutil import extract_website
 from scraping_router import route_scraping_request 
 from models import ScrapeRequest
 from psycopg2 import sql
@@ -15,8 +15,81 @@ import asyncio
 import logging
 import json
 import traceback
+from typing import Dict, Optional, List
+from threading import Lock
 
 logger = logging.getLogger(__name__)
+
+# In-memory storage for quick extract task results (execution_id -> result)
+# Also stored in database for cross-process access
+quick_extract_results: Dict[str, dict] = {}
+quick_extract_logs: Dict[str, List[dict]] = {}  # execution_id -> list of logs
+quick_extract_lock = Lock()
+
+def create_quick_extract_results_table(conn):
+    """Create quick_extract_results table if it doesn't exist."""
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS quick_extract_results (
+            execution_id VARCHAR(255) PRIMARY KEY,
+            status TEXT NOT NULL,
+            success BOOLEAN NOT NULL,
+            message TEXT,
+            data JSONB,
+            total_items INTEGER DEFAULT 0,
+            items_scraped INTEGER DEFAULT 0,
+            url TEXT,
+            scraped_at TIMESTAMP,
+            execution_duration_ms INTEGER,
+            error TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_quick_extract_results_execution_id ON quick_extract_results(execution_id);
+    """)
+    conn.commit()
+    cur.close()
+
+def create_quick_extract_logs_table(conn):
+    """Create quick_extract_logs table if it doesn't exist, and add new columns if missing."""
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS quick_extract_logs (
+            id SERIAL PRIMARY KEY,
+            execution_id VARCHAR(255) NOT NULL,
+            status TEXT NOT NULL,
+            log_level TEXT NOT NULL,
+            message TEXT NOT NULL,
+            details JSONB,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
+    
+    # Add new columns if they don't exist (for existing tables)
+    try:
+        cur.execute("""
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='quick_extract_logs' AND column_name='error_traceback') THEN
+                    ALTER TABLE quick_extract_logs ADD COLUMN error_traceback TEXT;
+                END IF;
+                
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='quick_extract_logs' AND column_name='execution_duration_ms') THEN
+                    ALTER TABLE quick_extract_logs ADD COLUMN execution_duration_ms INT;
+                END IF;
+            END $$;
+        """)
+    except Exception as e:
+        logger.warning(f"Error adding columns to quick_extract_logs table: {e}")
+    
+    # Create index if it doesn't exist
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_quick_extract_logs_execution_id ON quick_extract_logs(execution_id);
+    """)
+    conn.commit()
+    cur.close()
 
 VALID_REPEATS = {"once", "daily", "weekly", "monthly", "yearly"}
 # DATABASE_URL = os.getenv("DATABASE_URL","postgresql://postgres:9042c98a@host.docker.internal:5432/LeadGenerationPro")
@@ -71,79 +144,112 @@ def log_execution(conn, task_id: int, execution_id: str, status: str, log_level:
 # def get_db_cursor_docker():
 #     connection = psycopg2.connect(DATABASE_URL)
 #     return connection, connection.cursor()
-
 @router.post("/create-task", response_model=dict)
 async def create_task(request: TaskRequest):
-    """Create a scheduled scraping task."""
+    """Create a scheduled scraping task - supports both web and API sources."""
     try:
         if request.repeat not in VALID_REPEATS:
             raise HTTPException(status_code=400, detail="Invalid repeat value")
         
-        if request.scheduled_time < datetime.now(timezone.utc):
+        # Handle both tz-aware (e.g. "...+05:00") and tz-naive datetimes safely
+        sched = request.scheduled_time
+        now_utc = datetime.now(timezone.utc)
+        sched_utc = sched if sched.tzinfo else sched.replace(tzinfo=timezone.utc)
+        if sched_utc < now_utc:
             raise HTTPException(status_code=400, detail="Scheduled time must be in the future")
 
+
         conn, cur = get_db_cursor()
-        # cur = conn.cursor()
         
-        # Create tasks table if it doesn't exist
+        # 1. SCHEMA UPDATE: Add the column if it doesn't exist automatically
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-            id SERIAL PRIMARY KEY,
-            task_name TEXT UNIQUE NOT NULL,
-            source_id INT REFERENCES sources(id) ON DELETE CASCADE,
-            mapping_id INT REFERENCES entity_mappings(id) ON DELETE CASCADE,
-            scheduled_time TIMESTAMP NOT NULL,
-            repeat TEXT DEFAULT 'once' CHECK (repeat IN ('once', 'daily', 'weekly', 'monthly', 'yearly')),
-            last_executed_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT NOW(),
-            max_items INT DEFAULT 10,
-            CONSTRAINT unique_task_mapping UNIQUE (source_id, mapping_id, scheduled_time)
-            );
+            DO $$ 
+            BEGIN
+                -- Create table if missing
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id SERIAL PRIMARY KEY,
+                    task_name TEXT UNIQUE NOT NULL,
+                    source_id INT,
+                    mapping_id INT,
+                    scheduled_time TIMESTAMP NOT NULL,
+                    repeat TEXT DEFAULT 'once',
+                    last_executed_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    max_items INT DEFAULT 10,
+                    source_type VARCHAR(20) DEFAULT 'web',
+                    api_source_id INT
+                );
+
+                -- Add api_request_config column if missing
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='tasks' AND column_name='api_request_config') THEN
+                    ALTER TABLE tasks ADD COLUMN api_request_config JSONB DEFAULT '{}'::jsonb;
+                END IF;
+            END $$;
         """)
 
-        # Verify source exists
-        cur.execute("SELECT id FROM sources WHERE id = %s", (request.source_id,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=404, detail="Source not found")
-        
-        # Verify mapping exists and belongs to the source, get mapping details
-        cur.execute("""
-            SELECT id, mapping_name, entity_name 
-            FROM entity_mappings 
-            WHERE id = %s AND source_id = %s
-        """, (request.mapping_id, request.source_id))
-        
-        result = cur.fetchone()
-        if not result:
-            raise HTTPException(status_code=404, detail="Mapping not found for the specified source")
+        # 2. Handle both web and API sources
+        if request.source_type == 'web':
+            # Existing web source logic (UNCHANGED to prevent breaking things)
+            if not request.source_id:
+                raise HTTPException(status_code=400, detail="Please select a Web Source before creating a task.")
+            if not request.mapping_id:
+                raise HTTPException(status_code=400, detail="Please select a Mapping for the chosen source.")
+
             
-        mapping_id, mapping_name, entity_name = result
-        
-        # Generate unique task name if not provided
-        task_name = request.task_name
-        if not task_name:
-            timestamp = request.scheduled_time.strftime("%Y%m%d_%H%M%S")
-            task_name = f"{entity_name}_{mapping_name}_{timestamp}"
-            
-        # Ensure task name is unique
-        counter = 1
-        original_task_name = task_name
-        while True:
-            cur.execute("SELECT id FROM tasks WHERE task_name = %s", (task_name,))
+            cur.execute("SELECT id FROM sources WHERE id = %s", (request.source_id,))
             if not cur.fetchone():
-                break
-            task_name = f"{original_task_name}_{counter}"
-            counter += 1
-        
-        # Insert task
-        cur.execute("""
-            INSERT INTO tasks (task_name, source_id, mapping_id, scheduled_time, repeat, max_items)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING id
-        """, (task_name, request.source_id, request.mapping_id, request.scheduled_time, request.repeat, request.max_items))
+                raise HTTPException(status_code=404, detail="Source not found")
+            
+            cur.execute("SELECT mapping_name, entity_name FROM entity_mappings WHERE id = %s", (request.mapping_id,))
+            res = cur.fetchone()
+            if not res: raise HTTPException(status_code=404, detail="Mapping not found")
+                
+            mapping_name, entity_name = res
+            task_name = request.task_name or f"{entity_name}_{mapping_name}_{request.scheduled_time.strftime('%Y%m%d_%H%M%S')}"
+            
+            # Web tasks just use the default {} for api_request_config
+            cur.execute("""
+                INSERT INTO tasks (task_name, source_type, source_id, mapping_id, scheduled_time, repeat, max_items)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (task_name, 'web', request.source_id, request.mapping_id, request.scheduled_time, request.repeat, request.max_items))
+            
+        elif request.source_type == 'api':
+            # New API source logic
+            if not request.api_source_id:
+                raise HTTPException(status_code=400, detail="api_source_id required for API sources")
+            
+            cur.execute("SELECT name, entity_name FROM api_sources WHERE id = %s", (request.api_source_id,))
+            result = cur.fetchone()
+            if not result:
+                raise HTTPException(status_code=404, detail="API source not found")
+            
+            api_source_name, entity_name = result
+            task_name = request.task_name or f"{api_source_name}_{request.scheduled_time.strftime('%Y%m%d_%H%M%S')}"
+                
+            # --- FIXED: Insert including api_request_config ---
+            cur.execute("""
+                INSERT INTO tasks (task_name, source_type, api_source_id, scheduled_time, repeat, max_items, api_request_config)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                task_name, 
+                'api', 
+                request.api_source_id, 
+                request.scheduled_time, 
+                request.repeat, 
+                request.max_items,
+                json.dumps(request.api_request_config.dict()) if request.api_request_config else '{}'
+            ))
+            
+        else:
+            raise HTTPException(status_code=400, detail="source_type must be 'web' or 'api'")
         
         task_id = cur.fetchone()[0]
         conn.commit()
+        
+        # Schedule the job
         scheduler.add_job(
             lambda t=task_id: enqueue_and_reschedule(t),
             'date',
@@ -159,39 +265,45 @@ async def create_task(request: TaskRequest):
             "task_name": task_name,
             "message": f"Task '{task_name}' created successfully"
         }
-        
+           
     except HTTPException:
-        # conn.rollback()
-        raise
+        raise  # Re-raise 400/404 errors as-is with their meaningful messages
     except Exception as e:
-        # conn.rollback()
+        # if conn: conn.rollback()
+        logger.error(f"Error creating task: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")
+    finally:
+        logger.info("Task creation completed")
+        # if conn: conn.close()
+
 
 @router.get("/tasks", response_model=TasksListResponse)
 async def get_all_tasks():
-    """Get all scheduled tasks with their details."""
+    """Get all scheduled tasks with their details (both web and API sources)."""
     try:
         conn, cur = get_db_cursor()
-        # cur = conn.cursor()
         
+        # Union query to get both web and API tasks
         cur.execute("""
             SELECT 
                 t.id,
                 t.task_name,
-                t.source_id,
-                s.name as source_name,
-                t.mapping_id,
-                em.mapping_name,
-                em.entity_name,
+                COALESCE(t.source_id, -1) as source_id,
+                COALESCE(s.name, (SELECT name FROM api_sources WHERE id = t.api_source_id)) as source_name,
+                COALESCE(t.mapping_id, -1) as mapping_id,
+                COALESCE(em.mapping_name, 'N/A') as mapping_name,
+                COALESCE(em.entity_name, (SELECT entity_name FROM api_sources WHERE id = t.api_source_id)) as entity_name,
                 t.scheduled_time,
                 t.created_at,
                 t.repeat,
                 t.last_executed_at,
-                t.max_items
+                t.max_items,
+                COALESCE(t.source_type, 'web') as source_type,
+                COALESCE(t.api_source_id, -1) as api_source_id
                     
             FROM tasks t
-            JOIN sources s ON t.source_id = s.id
-            JOIN entity_mappings em ON t.mapping_id = em.id
+            LEFT JOIN sources s ON t.source_id = s.id AND t.source_type = 'web'
+            LEFT JOIN entity_mappings em ON t.mapping_id = em.id AND t.source_type = 'web'
             ORDER BY t.scheduled_time DESC
         """)
         
@@ -199,21 +311,24 @@ async def get_all_tasks():
         tasks = []
         
         for row in rows:
-            tasks.append(TaskInfo(
-                id=row[0],
-                task_name=row[1],
-                source_id=row[2],
-                source_name=row[3],
-                mapping_id=row[4],
-                mapping_name=row[5],
-                entity_name=row[6],
-                scheduled_time=row[7],
-                created_at=row[8],
-                repeat=row[9],
-                last_executed_at=row[10],
-                max_items=row[11]
-
-            ))
+            # Create task info with source type info
+            task_info_dict = {
+                "id": row[0],
+                "task_name": row[1],
+                "source_id": row[2],
+                "source_name": row[3],
+                "mapping_id": row[4],
+                "mapping_name": row[5],
+                "entity_name": row[6],
+                "scheduled_time": row[7],
+                "created_at": row[8],
+                "repeat": row[9],
+                "last_executed_at": row[10],
+                "max_items": row[11],
+                "source_type": row[12],
+                "api_source_id": row[13] if row[13] != -1 else None
+            }
+            tasks.append(TaskInfo(**task_info_dict))
         
         cur.close()
         
@@ -274,8 +389,13 @@ async def update_task(task_id: int, request: TaskUpdateRequest):
         if request.repeat not in VALID_REPEATS:
             raise HTTPException(status_code=400, detail="Invalid repeat value")
         
-        if request.scheduled_time < datetime.now(timezone.utc):
+        # Handle both tz-aware (e.g. "...+05:00") and tz-naive datetimes safely
+        sched = request.scheduled_time
+        now_utc = datetime.now(timezone.utc)
+        sched_utc = sched if sched.tzinfo else sched.replace(tzinfo=timezone.utc)
+        if sched_utc < now_utc:
             raise HTTPException(status_code=400, detail="Scheduled time must be in the future")
+
 
         conn, cur = get_db_cursor()
         
@@ -341,10 +461,10 @@ async def update_task(task_id: int, request: TaskUpdateRequest):
         }
         
     except HTTPException:
-        conn.rollback()
+        # conn.rollback()
         raise
     except Exception as e:
-        conn.rollback()
+        # conn.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to update task: {str(e)}")
  
 async def upsert_entity_record(cur,entity_name: str, source_name: str, item: dict):
@@ -487,7 +607,11 @@ async def upsert_entity_record(cur,entity_name: str, source_name: str, item: dic
 
 async def _execute_task_internal(task_id: int):
     """Internal function to execute a task by scraping data and storing it in the corresponding entity table.
-    This is called by the Kafka worker after consuming a task from the queue."""
+    This is called by the Kafka worker after consuming a task from the queue.
+    
+    Includes idempotency check: compares current execution with last_executed_at to prevent
+    duplicate execution when the same task is reprocessed from Kafka due to pod restart.
+    """
     import uuid
     execution_id = str(uuid.uuid4())
     execution_start = datetime.now()
@@ -498,8 +622,32 @@ async def _execute_task_internal(task_id: int):
         # Create execution logs table if it doesn't exist
         create_execution_logs_table(conn)
         
+        # Idempotency Check: Prevent re-execution if this task was already successfully executed recently
+        # This handles the case where a K8s pod restart causes Kafka to re-send old messages
+        cur.execute("""
+            SELECT last_executed_at FROM tasks WHERE id = %s
+        """, (task_id,))
+        task_last_exec = cur.fetchone()
+        if task_last_exec and task_last_exec[0]:
+            last_exec_time = task_last_exec[0]
+            # If last execution was less than 10 seconds ago, skip this execution
+            # (likely a duplicate from Kafka reprocessing)
+            time_since_last_exec = (datetime.now() - last_exec_time).total_seconds()
+            if time_since_last_exec < 10:
+                print(f"⚠️  Task {task_id} was already executed {time_since_last_exec:.1f} seconds ago. Skipping to prevent duplicate execution.")
+                return {
+                    "success": True,
+                    "task_id": task_id,
+                    "message": f"Task already executed recently (skipped duplicate from Kafka reprocessing)",
+                    "items_scraped": 0,
+                    "items_stored": 0,
+                    "execution_id": execution_id,
+                    "is_duplicate": True
+                }
+        
         # Log execution start
         log_execution(conn, task_id, execution_id, 'started', 'info', 
+
                      f'Task execution started', {'execution_id': execution_id})
         
         # Get task details with all necessary information
@@ -516,13 +664,16 @@ async def _execute_task_internal(task_id: int):
                 s.pagination_config,
                 s.is_captcha_protected,
                 s.captcha_params,
+                s.auth_config,
+                s.is_auth_protected,
                 t.mapping_id,
                 t.repeat,
                 t.max_items,
                 em.mapping_name,
                 em.entity_name,
                 em.container_selector,
-                em.field_mappings
+                em.field_mappings,
+                em.follow_links
             FROM tasks t
             JOIN sources s ON t.source_id = s.id
             JOIN entity_mappings em ON t.mapping_id = em.id
@@ -537,8 +688,8 @@ async def _execute_task_internal(task_id: int):
         
         
         # Extract task information
-        (task_id_db, task_name, source_id, source_name, source_url, pagination_config, is_captcha_protected, captcha_params,
-         mapping_id, repeat, max_items, mapping_name, entity_name, container_selector, field_mappings) = task_data
+        (task_id_db, task_name, source_id, source_name, source_url, pagination_config, is_captcha_protected, captcha_params, auth_config, is_auth_protected,
+         mapping_id, repeat, max_items, mapping_name, entity_name, container_selector, field_mappings, follow_links) = task_data
 
         log_execution(conn, task_id, execution_id, 'processing', 'info', 
                      'Task details retrieved successfully', {
@@ -547,24 +698,152 @@ async def _execute_task_internal(task_id: int):
                          'source_url': source_url,
                          'entity_name': entity_name,
                          'mapping_name': mapping_name,
-                         'max_items': max_items
+                         'max_items': max_items,
+                         'follow_links_raw': follow_links,
+                         'follow_links_type': type(follow_links).__name__,
+                         'follow_links_is_none': follow_links is None,
+                         'follow_links_length': len(follow_links) if follow_links else 0
                      })
 
         # Build ScrapeRequest from task data
         log_execution(conn, task_id, execution_id, 'processing', 'info', 
                      'Building scrape request')
         
+        # Convert field_mappings from dict to FieldMapping objects
+        field_mappings_objects = {}
+        if field_mappings:
+            try:
+                for key, value in field_mappings.items():
+                    if isinstance(value, dict):
+                        field_mappings_objects[key] = FieldMapping(**value)
+                    else:
+                        field_mappings_objects[key] = value
+            except Exception as e:
+                log_execution(conn, task_id, execution_id, 'processing', 'error',
+                             f'Error converting field_mappings: {str(e)}')
+                raise HTTPException(status_code=500, detail=f"Failed to convert field_mappings: {str(e)}")
+        
+        # Convert follow_links JSON to FollowLink objects if present
+        follow_links_objects = []
+        if follow_links is not None:
+            if isinstance(follow_links, list) and len(follow_links) > 0:
+                try:
+                    log_execution(conn, task_id, execution_id, 'processing', 'info',
+                                 f'Converting follow_links: {len(follow_links)} link(s) found')
+                    log_execution(conn, task_id, execution_id, 'processing', 'debug',
+                                 f'Raw follow_links data: {follow_links}')
+                    for fl_dict in follow_links:
+                        # Validate required fields - check both "selector" and "selectorField" (for backward compatibility)
+                        selector_value = fl_dict.get("selector") or fl_dict.get("selectorField")
+                        name_value = fl_dict.get("name")
+                        
+                        # Ensure both name and selector are non-empty strings
+                        if not name_value or not isinstance(name_value, str) or not name_value.strip():
+                            log_execution(conn, task_id, execution_id, 'processing', 'warning',
+                                         f'Skipping invalid follow_link: missing or invalid name. Dict keys: {list(fl_dict.keys())}, Dict: {fl_dict}')
+                            continue
+                        
+                        if not selector_value or not isinstance(selector_value, str) or not selector_value.strip():
+                            log_execution(conn, task_id, execution_id, 'processing', 'warning',
+                                         f'Skipping invalid follow_link: missing or invalid selector. Dict keys: {list(fl_dict.keys())}, Dict: {fl_dict}')
+                            continue
+                        
+                        log_execution(conn, task_id, execution_id, 'processing', 'info',
+                                     f'Processing follow_link: name={name_value}, selector={selector_value}, field_mappings_keys={list(fl_dict.get("field_mappings", {}).keys())}')
+                        try:
+                            follow_link_obj = FollowLink(
+                                name=name_value.strip(),
+                                selector=selector_value.strip(),  # Use the found selector value
+                                field_mappings={
+                                    key: FieldMapping(**fm_dict)
+                                    for key, fm_dict in fl_dict.get("field_mappings", {}).items()
+                                }
+                            )
+                            # Double-check the object was created correctly by accessing the attribute
+                            try:
+                                test_selector = follow_link_obj.selector
+                                test_name = follow_link_obj.name
+                                test_fields = follow_link_obj.field_mappings
+                            except AttributeError as attr_err:
+                                log_execution(conn, task_id, execution_id, 'processing', 'error',
+                                             f'FollowLink object missing attribute: {str(attr_err)}, Object type: {type(follow_link_obj)}, Dict: {fl_dict}')
+                                continue
+                            
+                            follow_links_objects.append(follow_link_obj)
+                            log_execution(conn, task_id, execution_id, 'processing', 'info',
+                                         f'Follow link converted: {follow_link_obj.name} with selector={follow_link_obj.selector} and {len(follow_link_obj.field_mappings)} field(s)')
+                        except Exception as fl_error:
+                            log_execution(conn, task_id, execution_id, 'processing', 'error',
+                                         f'Error creating FollowLink object: {str(fl_error)}, dict: {fl_dict}, traceback: {traceback.format_exc()}')
+                            continue
+                except Exception as e:
+                    log_execution(conn, task_id, execution_id, 'processing', 'error',
+                                 f'Error parsing follow_links: {str(e)}, traceback: {traceback.format_exc()}')
+                    follow_links_objects = []
+            else:
+                log_execution(conn, task_id, execution_id, 'processing', 'info',
+                             f'follow_links is empty or not a list: {follow_links}')
+        else:
+            log_execution(conn, task_id, execution_id, 'processing', 'info',
+                         'follow_links is None in database')
+        
         # Build ScrapeRequest from task data
-        scrape_request = ScrapeRequest(
-            entity_name=entity_name,
-            url=source_url,
-            pagination_config=pagination_config,
-            container_selector=container_selector,
-            field_mappings=field_mappings,
-            max_items=max_items,
-            timeout=30,
-            captcha_params=captcha_params if is_captcha_protected else None
-        )
+        # Validate follow_links_objects before creating ScrapeRequest
+        validated_follow_links = []
+        for fl in follow_links_objects:
+            if hasattr(fl, 'selector') and hasattr(fl, 'name') and hasattr(fl, 'field_mappings'):
+                validated_follow_links.append(fl)
+            else:
+                log_execution(conn, task_id, execution_id, 'processing', 'error',
+                             f'Invalid FollowLink object: has selector={hasattr(fl, "selector")}, has name={hasattr(fl, "name")}, has field_mappings={hasattr(fl, "field_mappings")}, object type={type(fl)}')
+        
+        try:
+            scrape_request = ScrapeRequest(
+                entity_name=entity_name,
+                url=source_url,
+                pagination_config=pagination_config,
+                container_selector=container_selector,
+                field_mappings=field_mappings_objects,
+                follow_links=validated_follow_links,
+                max_items=max_items,
+                timeout=30,
+                captcha_params=captcha_params if is_captcha_protected else None,
+                auth_config=auth_config if is_auth_protected else None
+            )
+        except Exception as scrape_req_error:
+            log_execution(conn, task_id, execution_id, 'processing', 'error',
+                         f'Error creating ScrapeRequest: {str(scrape_req_error)}, traceback: {traceback.format_exc()}')
+            log_execution(conn, task_id, execution_id, 'processing', 'error',
+                         f'FollowLinks objects: {[type(fl).__name__ for fl in validated_follow_links]}')
+            log_execution(conn, task_id, execution_id, 'processing', 'error',
+                         f'First FollowLink attributes: {dir(validated_follow_links[0]) if validated_follow_links else "No follow links"}')
+            raise HTTPException(status_code=500, detail=f"Failed to create ScrapeRequest: {str(scrape_req_error)}")
+        
+        # Log the scrape request details
+        follow_links_details = []
+        for fl in validated_follow_links:
+            try:
+                # Safely access attributes
+                fl_name = getattr(fl, 'name', 'UNKNOWN')
+                fl_selector = getattr(fl, 'selector', 'MISSING')
+                fl_fields = list(getattr(fl, 'field_mappings', {}).keys())
+                follow_links_details.append({
+                    'name': fl_name,
+                    'selector': fl_selector,
+                    'fields': fl_fields
+                })
+            except Exception as e:
+                log_execution(conn, task_id, execution_id, 'processing', 'warning',
+                             f'Error logging follow_link details: {str(e)}, object type: {type(fl)}')
+                follow_links_details.append({'error': str(e), 'object_type': str(type(fl))})
+        
+        log_execution(conn, task_id, execution_id, 'processing', 'info',
+                     'ScrapeRequest built', {
+                         'has_follow_links': len(follow_links_objects) > 0,
+                         'follow_links_count': len(follow_links_objects),
+                         'follow_links_details': follow_links_details,
+                         'field_mappings_count': len(field_mappings_objects)
+                     })
         # if user left params to us to auto-detect
         if is_captcha_protected and scrape_request.captcha_params is None:
             scrape_request.captcha_params = CaptchaParams(
@@ -579,8 +858,8 @@ async def _execute_task_internal(task_id: int):
         scrape_response = await route_scraping_request(scrape_request)
         scrape_duration = int((datetime.now() - scrape_start).total_seconds() * 1000)
 
-        # clip to max_items (before was handled in crawler)
-        scrape_data = scrape_response.data[:max_items] if scrape_response.data else [] 
+        # No need to clip - pagination limit is now enforced in helperutil.py during scraping
+        scrape_data = scrape_response.data if scrape_response.data else [] 
         
         if not scrape_response.success or not scrape_data:
             error_details = {
@@ -633,6 +912,49 @@ async def _execute_task_internal(task_id: int):
                          'columns': list(table_columns.keys())
                      })
         
+        # Check for missing columns in scraped data and add them to the table
+        # This is especially important for multi-page scraping where detail page fields
+        # (e.g., "detail_1_description") need to be added as columns
+        all_scraped_fields = set()
+        for item in scrape_data:
+            all_scraped_fields.update(item.keys())
+        
+        # Exclude system columns and internal fields
+        system_columns = {'id', 'source', 'modified_at', '_follow_urls'}
+        missing_columns = all_scraped_fields - set(table_columns.keys()) - system_columns
+        
+        if missing_columns:
+            log_execution(conn, task_id, execution_id, 'processing', 'info', 
+                         f'Found {len(missing_columns)} missing column(s) in entity table', {
+                             'missing_columns': list(missing_columns),
+                             'table_name': entity_name
+                         })
+            
+            # Add missing columns to the table (all as TEXT by default)
+            for col_name in missing_columns:
+                try:
+                    # Sanitize column name
+                    clean_col_name = col_name.strip().lower().replace(' ', '_').replace('-', '_')
+                    # Remove special characters, keep only alphanumeric and underscore
+                    clean_col_name = ''.join(c for c in clean_col_name if c.isalnum() or c == '_')
+                    
+                    if clean_col_name and clean_col_name not in system_columns:
+                        alter_stmt = sql.SQL("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} TEXT;").format(
+                            table=sql.Identifier(entity_name),
+                            col=sql.Identifier(clean_col_name)
+                        )
+                        cur.execute(alter_stmt)
+                        table_columns[clean_col_name] = 'TEXT'  # Update local cache
+                        log_execution(conn, task_id, execution_id, 'processing', 'info', 
+                                     f'Added column {clean_col_name} to entity table {entity_name}')
+                except Exception as e:
+                    log_execution(conn, task_id, execution_id, 'processing', 'warning', 
+                                 f'Failed to add column {col_name} to table: {str(e)}')
+            
+            conn.commit()  # Commit the ALTER TABLE statements
+            log_execution(conn, task_id, execution_id, 'processing', 'info', 
+                         f'Successfully added {len(missing_columns)} column(s) to entity table')
+        
         # Insert / Update scraped data in the entity table
         log_execution(conn, task_id, execution_id, 'processing', 'info', 
                      'Starting to upsert scraped data into database')
@@ -642,7 +964,69 @@ async def _execute_task_internal(task_id: int):
         upsert_errors = []
         
         for idx, item in enumerate(scrape_data):
-            insert_data = {col: item.get(col) for col in table_columns.keys()}
+            # Normalize field names for case-insensitive matching
+            def normalize_field_name(name):
+                """Normalize field name to match database column naming convention"""
+                normalized = name.strip().lower().replace(' ', '_').replace('-', '_')
+                return ''.join(c for c in normalized if c.isalnum() or c == '_')
+            
+            # Create normalized lookup dictionary from item
+            item_normalized = {}
+            for k, v in item.items():
+                if k == '_follow_urls':
+                    continue
+                normalized_key = normalize_field_name(k)
+                # Store both original and normalized for lookup
+                item_normalized[normalized_key] = v
+                if k not in item_normalized:  # Keep original key too if different
+                    item_normalized[k] = v
+            
+            # Match table columns to item fields (try exact match first, then normalized)
+            # Also try case-insensitive matching
+            insert_data = {}
+            unmatched_columns = []
+            unmatched_item_fields = []
+            
+            # Create case-insensitive lookup for item fields
+            item_case_insensitive = {k.lower(): (k, v) for k, v in item.items() if k != '_follow_urls'}
+            
+            for col in table_columns.keys():
+                # Try exact match first
+                if col in item:
+                    insert_data[col] = item[col]
+                # Try case-insensitive match
+                elif col.lower() in item_case_insensitive:
+                    original_key, value = item_case_insensitive[col.lower()]
+                    insert_data[col] = value
+                # Try normalized match
+                else:
+                    col_normalized = normalize_field_name(col)
+                    if col_normalized in item_normalized:
+                        insert_data[col] = item_normalized[col_normalized]
+                    else:
+                        unmatched_columns.append(col)
+            
+            # Find item fields that weren't matched to any column
+            matched_item_fields = set(insert_data.keys())
+            for k in item.keys():
+                if k != '_follow_urls' and k not in matched_item_fields:
+                    k_normalized = normalize_field_name(k)
+                    if k_normalized not in [normalize_field_name(col) for col in matched_item_fields]:
+                        unmatched_item_fields.append(k)
+            
+            # Log detail page fields for debugging (first 3 items)
+            if idx < 3:
+                detail_fields_in_item = {k: v for k, v in item.items() if '_' in k and (k.startswith(('detail_', 'follow_')) or any(x in k for x in ['detail', 'follow']))}
+                detail_fields_in_insert = {k: v for k, v in insert_data.items() if '_' in k and (k.startswith(('detail_', 'follow_')) or any(x in k for x in ['detail', 'follow']))}
+                
+                log_execution(conn, task_id, execution_id, 'processing', 'debug',
+                             f'Item {idx + 1} field matching', {
+                                 'detail_fields_in_scraped_data': list(detail_fields_in_item.keys()),
+                                 'detail_fields_being_stored': list(detail_fields_in_insert.keys()),
+                                 'unmatched_columns': unmatched_columns[:5],  # First 5
+                                 'unmatched_item_fields': unmatched_item_fields[:5]  # First 5
+                             })
+            
             try:
                 await upsert_entity_record(cur, entity_name, source_name, insert_data)
                 items_stored += 1
@@ -735,6 +1119,98 @@ async def _execute_task_internal(task_id: int):
 # Alias for backward compatibility with worker.py
 execute_task = _execute_task_internal
 
+# @router.post("/execute-task/{task_id}")
+# async def execute_task_endpoint(task_id: int):
+#     """Enqueue a task to Kafka for execution by the worker."""
+#     conn = None
+#     try:
+#         conn, cur = get_db_cursor()
+        
+#         # Verify task exists
+#         cur.execute("""
+#             SELECT t.id, t.task_name, em.entity_name
+#             FROM tasks t
+#             JOIN entity_mappings em ON t.mapping_id = em.id
+#             WHERE t.id = %s
+#         """, (task_id,))
+        
+#         task_data = cur.fetchone()
+#         if not task_data:
+#             raise HTTPException(status_code=404, detail="Task not found")
+        
+#         task_name = task_data[1]
+#         entity_name = task_data[2]
+#         cur.close()
+
+#         # Enqueue task to Kafka instead of executing directly
+#         enqueue_task(task_id)
+
+#         # To avoid duplicate immediate executions when the scheduler also has
+#         # a job scheduled for this task, remove the scheduler job (if any)
+#         # and reschedule the next occurrence when applicable. This makes
+#         # manual execute behave like a one-off run while preserving the
+#         # repeating schedule.
+#         try:
+#             job_id = str(task_id)
+#             try:
+#                 if scheduler.get_job(job_id):
+#                     scheduler.remove_job(job_id)
+#             except Exception:
+#                 # If scheduler isn't running in this process or job not found,
+#                 # ignore and continue.
+#                 pass
+
+#             # Fetch current repeat and scheduled_time and reschedule next occurrence
+#             conn2, cur2 = get_db_cursor()
+#             try:
+#                 cur2.execute("SELECT repeat, scheduled_time FROM tasks WHERE id = %s", (task_id,))
+#                 row = cur2.fetchone()
+#                 if row:
+#                     repeat, scheduled_time = row[0], row[1]
+#                     next_time = get_next_scheduled_time(repeat, scheduled_time)
+#                     if next_time:
+#                         cur2.execute("UPDATE tasks SET scheduled_time = %s WHERE id = %s", (next_time, task_id))
+#                         conn2.commit()
+#                         try:
+#                             scheduler.add_job(
+#                                 lambda t=task_id: enqueue_and_reschedule(t),
+#                                 'date',
+#                                 id=job_id,
+#                                 replace_existing=True,
+#                                 run_date=next_time
+#                             )
+#                         except Exception:
+#                             pass
+#             finally:
+#                 try:
+#                     cur2.close()
+#                 except Exception:
+#                     pass
+#                 try:
+#                     conn2.close()
+#                 except Exception:
+#                     pass
+#         except Exception:
+#             # Non-fatal: don't block the API response if scheduler update fails
+#             pass
+
+#         return {
+#             "success": True,
+#             "task_id": task_id,
+#             "task_name": task_name,
+#             "entity_name": entity_name,
+#             "message": f"Task '{task_name}' has been queued for execution in Kafka",
+#             "queued": True
+#         }
+        
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Failed to enqueue task: {str(e)}")
+#     finally:
+#         if conn:
+#             conn.close()
+
 @router.post("/execute-task/{task_id}")
 async def execute_task_endpoint(task_id: int):
     """Enqueue a task to Kafka for execution by the worker."""
@@ -742,11 +1218,15 @@ async def execute_task_endpoint(task_id: int):
     try:
         conn, cur = get_db_cursor()
         
-        # Verify task exists
+        # FIXED: Use LEFT JOIN and COALESCE to support both web (entity_mappings) and api (api_sources)
         cur.execute("""
-            SELECT t.id, t.task_name, em.entity_name
+            SELECT 
+                t.id, 
+                t.task_name, 
+                COALESCE(em.entity_name, aps.entity_name) as entity_name
             FROM tasks t
-            JOIN entity_mappings em ON t.mapping_id = em.id
+            LEFT JOIN entity_mappings em ON t.mapping_id = em.id AND t.source_type = 'web'
+            LEFT JOIN api_sources aps ON t.api_source_id = aps.id AND t.source_type = 'api'
             WHERE t.id = %s
         """, (task_id,))
         
@@ -758,25 +1238,15 @@ async def execute_task_endpoint(task_id: int):
         entity_name = task_data[2]
         cur.close()
 
-        # Enqueue task to Kafka instead of executing directly
+        # Enqueue task to Kafka
         enqueue_task(task_id)
 
-        # To avoid duplicate immediate executions when the scheduler also has
-        # a job scheduled for this task, remove the scheduler job (if any)
-        # and reschedule the next occurrence when applicable. This makes
-        # manual execute behave like a one-off run while preserving the
-        # repeating schedule.
+        # Scheduler logic
         try:
             job_id = str(task_id)
-            try:
-                if scheduler.get_job(job_id):
-                    scheduler.remove_job(job_id)
-            except Exception:
-                # If scheduler isn't running in this process or job not found,
-                # ignore and continue.
-                pass
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
 
-            # Fetch current repeat and scheduled_time and reschedule next occurrence
             conn2, cur2 = get_db_cursor()
             try:
                 cur2.execute("SELECT repeat, scheduled_time FROM tasks WHERE id = %s", (task_id,))
@@ -787,27 +1257,17 @@ async def execute_task_endpoint(task_id: int):
                     if next_time:
                         cur2.execute("UPDATE tasks SET scheduled_time = %s WHERE id = %s", (next_time, task_id))
                         conn2.commit()
-                        try:
-                            scheduler.add_job(
-                                lambda t=task_id: enqueue_and_reschedule(t),
-                                'date',
-                                id=job_id,
-                                replace_existing=True,
-                                run_date=next_time
-                            )
-                        except Exception:
-                            pass
+                        scheduler.add_job(
+                            lambda t=task_id: enqueue_and_reschedule(t),
+                            'date',
+                            id=job_id,
+                            replace_existing=True,
+                            run_date=next_time
+                        )
             finally:
-                try:
-                    cur2.close()
-                except Exception:
-                    pass
-                try:
-                    conn2.close()
-                except Exception:
-                    pass
+                cur2.close()
+                conn2.close()
         except Exception:
-            # Non-fatal: don't block the API response if scheduler update fails
             pass
 
         return {
@@ -818,7 +1278,6 @@ async def execute_task_endpoint(task_id: int):
             "message": f"Task '{task_name}' has been queued for execution in Kafka",
             "queued": True
         }
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -827,6 +1286,60 @@ async def execute_task_endpoint(task_id: int):
         if conn:
             conn.close()
 
+# @router.get("/task-execution-history/{task_id}")
+# async def get_task_execution_history(task_id: int):
+#     """Get execution history for a specific task."""
+#     try:
+#         conn, cur = get_db_cursor()
+        
+#         # Get task info
+#         cur.execute("""
+#             SELECT 
+#                 t.id,
+#                 t.task_name,
+#                 s.name as source_name,
+#                 em.entity_name,
+#                 t.created_at,
+#                 t.scheduled_time,
+#                 t.repeat,
+#                 t.last_executed_at,
+#                 t.max_items
+                
+#             FROM tasks t
+#             JOIN sources s ON t.source_id = s.id
+#             JOIN entity_mappings em ON t.mapping_id = em.id
+#             WHERE t.id = %s
+#         """, (task_id,))
+        
+#         task_info = cur.fetchone()
+#         if not task_info:
+#             raise HTTPException(status_code=404, detail="Task not found")
+        
+#         # Get count of records in entity table (as a simple execution indicator)
+#         entity_name = task_info[3]
+#         cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(entity_name)))
+#         record_count = cur.fetchone()[0]
+        
+#         cur.close()
+        
+#         return {
+#             "task_id": task_info[0],
+#             "task_name": task_info[1],
+#             "source_name": task_info[2],
+#             "entity_name": task_info[3],
+#             "created_at": task_info[4],
+#             "scheduled_time": task_info[5],
+#             "repeat": task_info[6],
+#             "last_executed_at": task_info[7],
+#             "max_items": task_info[8],
+#             "current_record_count": record_count
+            
+#         }
+        
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Failed to get execution history: {str(e)}")
 
 @router.get("/task-execution-history/{task_id}")
 async def get_task_execution_history(task_id: int):
@@ -834,22 +1347,22 @@ async def get_task_execution_history(task_id: int):
     try:
         conn, cur = get_db_cursor()
         
-        # Get task info
+        # FIXED: Supports both source types
         cur.execute("""
             SELECT 
                 t.id,
                 t.task_name,
-                s.name as source_name,
-                em.entity_name,
+                COALESCE(s.name, aps.name) as source_name,
+                COALESCE(em.entity_name, aps.entity_name) as entity_name,
                 t.created_at,
                 t.scheduled_time,
                 t.repeat,
                 t.last_executed_at,
                 t.max_items
-                
             FROM tasks t
-            JOIN sources s ON t.source_id = s.id
-            JOIN entity_mappings em ON t.mapping_id = em.id
+            LEFT JOIN sources s ON t.source_id = s.id AND t.source_type = 'web'
+            LEFT JOIN entity_mappings em ON t.mapping_id = em.id AND t.source_type = 'web'
+            LEFT JOIN api_sources aps ON t.api_source_id = aps.id AND t.source_type = 'api'
             WHERE t.id = %s
         """, (task_id,))
         
@@ -857,11 +1370,16 @@ async def get_task_execution_history(task_id: int):
         if not task_info:
             raise HTTPException(status_code=404, detail="Task not found")
         
-        # Get count of records in entity table (as a simple execution indicator)
         entity_name = task_info[3]
-        cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(entity_name)))
-        record_count = cur.fetchone()[0]
         
+        # Check if table exists before counting to avoid crash
+        cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)", (entity_name.lower(),))
+        if cur.fetchone()[0]:
+            cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(entity_name)))
+            record_count = cur.fetchone()[0]
+        else:
+            record_count = 0
+            
         cur.close()
         
         return {
@@ -875,14 +1393,12 @@ async def get_task_execution_history(task_id: int):
             "last_executed_at": task_info[7],
             "max_items": task_info[8],
             "current_record_count": record_count
-            
         }
-        
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get execution history: {str(e)}")
-
+    
 @router.get("/task-execution-logs/{task_id}")
 async def get_task_execution_logs(task_id: int, execution_id: str = None, limit: int = 1000):
     """Get detailed execution logs for a specific task. Optionally filter by execution_id."""
@@ -1036,53 +1552,6 @@ async def get_task_execution_summary(task_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get execution summary: {str(e)}")
 
-
-@router.post("/preview-mapping")
-async def preview_mapping(request: PreviewMappingRequest):
-    """Preview scraping results for a mapping configuration without saving."""
-    try:
-        # Build ScrapeRequest from the preview request
-        scrape_request = ScrapeRequest(
-            entity_name=request.entity_name,
-            url=request.url,
-            container_selector=request.container_selector,
-            field_mappings=request.field_mappings,
-            max_items=5,  # Limit to 5 items for preview
-            timeout=15
-        )
-        
-        # Execute scraping using the dynamic scraper
-        scrape_response = await route_scraping_request(scrape_request)
-        
-        if not scrape_response.success:
-            return {
-                "success": False,
-                "message": f"Preview failed: {scrape_response.message}",
-                "data": [],
-                "total_items": 0
-            }
-        
-        # Limit to first 5 items for preview
-        preview_data = scrape_response.data[:5] if scrape_response.data else []
-        
-        return {
-            "success": True,
-            "message": f"Preview successful - showing first {len(preview_data)} items",
-            "data": preview_data,
-            "total_items": scrape_response.total_items,
-            "entity_name": request.entity_name,
-            "url": request.url,
-            "scraped_at": scrape_response.scraped_at.isoformat()
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"Preview error: {str(e)}",
-            "data": [],
-            "total_items": 0
-        }
-
 def get_source_by_url(url: str):
     """
     Get a specific source by its URL.
@@ -1114,82 +1583,941 @@ def get_source_by_url(url: str):
         print(f"Error fetching source by URL: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch source: {str(e)}")
     
-@router.post("/preview-next-mapping")
-async def preview_next_mapping(request: PreviewMappingRequest):
-    """Preview next page/scroll scraping results for a mapping configuration without saving."""
+@router.post("/preview-mapping")
+async def preview_mapping(request: PreviewMappingRequest):
+    """
+    General preview endpoint.
+    - step = 1  → first 5 items (cheap)
+    - step >= 2  → progressive pagination preview (last 5 items)
+    """
     try:
-        source=get_source_by_url(request.url)
-        if source is None: #abhi k liye (not actually needed)
-            return {
-            "success": False,
-            "message": f"Next Preview failed: Source not found for URL {request.url}",
-            "data": [],
-            "total_items": 0
-        }
-
-        # Take a dict copy
-        pagination_dict = source.pagination_config.model_dump()  # All fields included
-
-
-        print ("Pagination:", pagination_dict["type"], ", Source:", source.name)
-       
-        if pagination_dict is None:
-            return {
-            "success": False,
-            "message": f"Next Preview failed: No pagination config found for source {source.get('name')}",
-            "data": [],
-            "total_items": 0
-        }
+        step = request.preview_step or 1
         
-        # Prepare modified pagination config for preview
-        if pagination_dict["type"] not in ["button_click","scroll","ajax_click"]:
-            pagination_dict["max_pages"] = 2
-        elif pagination_dict["type"] in ["button_click","ajax_click"]:
-            pagination_dict["click_steps"] = 2
-        else:
-            pagination_dict["scroll_steps"] = 2
+        # Debug: log the request to help diagnose validation issues
+        print(f"Preview request - entity: {request.entity_name}, follow_links: {len(request.follow_links or [])}")
 
+        # STEP 1 → SIMPLE PREVIEW
+        if step == 1:
+            scrape_request = ScrapeRequest(
+                entity_name=request.entity_name,
+                url=request.url,
+                container_selector=request.container_selector,
+                field_mappings=request.field_mappings,
+                follow_links=request.follow_links,
+                max_items=5,
+                timeout=15
+            )
+            scrape_response = await route_scraping_request(scrape_request)
 
-        # Build ScrapeRequest from the preview request
+            if not scrape_response.success:
+                return {
+                    "success": False,
+                    "message": f"Preview failed: {scrape_response.message}",
+                    "data": [],
+                    "total_items": 0
+                }
+
+            preview_data = scrape_response.data[:5]
+            return {
+                "success": True,
+                "message": f"Preview successful - Page 1",
+                "data": preview_data,
+                "total_items": scrape_response.total_items,
+                "preview_step": 1,
+                "entity_name": request.entity_name,
+                "url": request.url,
+                "scraped_at": scrape_response.scraped_at.isoformat(),
+                "page_size" :scrape_response.page_size
+            }
+
+        # STEP >= 2 → PAGINATED / NEXT PREVIEW
+
+        source = get_source_by_url(request.url)
+        if not source or not source.pagination_config:
+            return {
+                "success": False,
+                "message": "Pagination config not found for source",
+                "data": [],
+                "total_items": 0
+            }
+
+        pagination_dict = source.pagination_config.model_dump()
+        pagination_type = pagination_dict.get("type")
+        
+        if not pagination_type:
+            return {
+                "success": False,
+                "message": "Pagination type is required for step 2+ previews",
+                "data": [],
+                "total_items": 0
+            }
+
+        # For step >= 2, we want to show only the NEXT page's data (first 5 items)
+        # So for step 2, scrape only page 2; for step 3, scrape only page 3, etc.
+        # Get the original start_page (default to 1 if not specified)
+        original_start_page = pagination_dict.get("start_page", 1)
+        
+        # Calculate which page we want to show (step 2 = page 2, step 3 = page 3, etc.)
+        target_page = original_start_page + (step - 1)
+        
+        # Adjust pagination to start from target_page and only scrape 1 page
+        if pagination_type not in ["button_click", "scroll", "ajax_click"]:
+            # For query_param, offset, path: set start_page to target_page and max_pages to 1
+            pagination_dict["start_page"] = target_page
+            pagination_dict["max_pages"] = 1
+        elif pagination_type in ["button_click", "ajax_click"]:
+            # For button clicks: set click_steps to step
+            pagination_dict["click_steps"] = step
+        else:  # scroll
+            # Similar to button clicks
+            pagination_dict["scroll_steps"] = step
+
         scrape_request = ScrapeRequest(
             entity_name=request.entity_name,
             url=request.url,
             container_selector=request.container_selector,
             field_mappings=request.field_mappings,
-            max_items=500,  # setting 500 items to allow next page preview
+            follow_links=request.follow_links,
+            max_items=5,  # Limit to 5 items for preview
             timeout=15,
-            pagination_config=pagination_dict
+            pagination_config=PaginationConfig(**pagination_dict)
         )
-        print ("Going to execute")
-        # Execute scraping using the dynamic scraper
         scrape_response = await route_scraping_request(scrape_request)
-        
+
         if not scrape_response.success:
             return {
                 "success": False,
-                "message": f"Next Preview failed: {scrape_response.message}",
+                "message": f"Preview failed: {scrape_response.message}",
                 "data": [],
                 "total_items": 0
             }
         
-        # Limit to last 5 items for preview if next page items are coming
-        preview_data = scrape_response.data[-5:] if scrape_response.data else []
+        # Get first 5 items from the scraped page (not last 5)
+        preview_data = scrape_response.data[:5] if scrape_response.data else []
+        
+        # For button_click and scroll, we need to take the last 5 items since we can't jump to a specific page
+        if pagination_type in ["button_click", "scroll", "ajax_click"]:
+            preview_data = scrape_response.data[-5:] if scrape_response.data else []
 
-        print(f"Next Preview Success - showing {len(preview_data)} items from next page")
+        if not preview_data:
+            return {
+                "success": False,
+                "message": "No items found for this page",
+                "data": [],
+                "total_items": 0
+            }
+
+        if not preview_data:
+            return {
+                "success": False,
+                "message": f"No items found for page {step}",
+                "data": [],
+                "total_items": scrape_response.total_items,
+                "preview_step": step,
+                "entity_name": request.entity_name,
+                "url": str(request.url),
+                "scraped_at": scrape_response.scraped_at.isoformat() if scrape_response.scraped_at else None,
+                "page_size": scrape_response.page_size
+            }
+
         return {
             "success": True,
-            "message": f"Next Preview Success - showing {len(preview_data)} items from next page",
+            "message": f"Preview successful - Page {step} (showing {len(preview_data)} items from this page)",
             "data": preview_data,
             "total_items": scrape_response.total_items,
+            "preview_step": step,
             "entity_name": request.entity_name,
             "url": request.url,
-            "scraped_at": scrape_response.scraped_at.isoformat()
+            "scraped_at": scrape_response.scraped_at.isoformat(),
+            "page_size" :scrape_response.page_size
         }
-        
+
     except Exception as e:
         return {
             "success": False,
-            "message": f"Next Preview error: {str(e)}",
+            "message": f"Preview error: {str(e)}",
             "data": [],
             "total_items": 0
         }
+
+def log_quick_extract(execution_id: str, status: str, log_level: str, message: str, details: dict = None, 
+                     error_traceback: str = None, execution_duration_ms: int = None):
+    """Log a message for quick extract task execution."""
+    log_entry = {
+        "execution_id": execution_id,
+        "status": status,
+        "log_level": log_level,
+        "message": message,
+        "details": details or {},
+        "error_traceback": error_traceback,
+        "execution_duration_ms": execution_duration_ms,
+        "created_at": datetime.now().isoformat()
+    }
+    # Store in memory
+    with quick_extract_lock:
+        if execution_id not in quick_extract_logs:
+            quick_extract_logs[execution_id] = []
+        quick_extract_logs[execution_id].append(log_entry)
+    
+    # Also store in database for cross-process access
+    try:
+        conn, cur = get_db_cursor()
+        create_quick_extract_logs_table(conn)
+        cur.execute("""
+            INSERT INTO quick_extract_logs (execution_id, status, log_level, message, details, error_traceback, execution_duration_ms)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (execution_id, status, log_level, message, json.dumps(details or {}), error_traceback, execution_duration_ms))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.debug(f"Stored log in database: execution_id={execution_id}, status={status}, message={message[:50]}")
+    except Exception as e:
+        logger.warning(f"Failed to store log in database: {e}", exc_info=True)
+
+async def execute_quick_extract_task(execution_id: str, request_data: dict):
+    """
+    Execute a quick extract task without storing data in database.
+    This is called by the worker when processing quick extract tasks from Kafka.
+    """
+    execution_start = datetime.now()
+    
+    # Check if task is already running to prevent duplicate execution
+    with quick_extract_lock:
+        existing_result = quick_extract_results.get(execution_id)
+        if existing_result and existing_result.get("status") in ["processing", "started"]:
+            print(f"⚠️ Task {execution_id} is already running, skipping duplicate execution")
+            return {
+                "success": False,
+                "message": f"Task {execution_id} is already being processed",
+                "execution_id": execution_id
+            }
+    
+    try:
+        # Initialize logs
+        log_quick_extract(execution_id, "started", "info", "Task execution started", {"execution_id": execution_id})
+        
+        # Update status to processing
+        with quick_extract_lock:
+            quick_extract_results[execution_id] = {
+                "status": "processing",
+                "message": "Task execution started",
+                "execution_id": execution_id,
+                "started_at": execution_start.isoformat()
+            }
+        
+        # Reconstruct QuickExtractRequest from request_data
+        from models import FieldMapping
+        from pydantic import HttpUrl
+        
+        log_quick_extract(execution_id, "processing", "info", "Fetching task details from request", {
+            "has_url": bool(request_data.get("url")),
+            "has_field_mappings": bool(request_data.get("field_mappings")),
+            "has_pagination": bool(request_data.get("pagination_config")),
+            "has_captcha": bool(request_data.get("captcha_params"))
+        })
+        
+        # Convert field_mappings back to proper format
+        field_mappings = {}
+        for key, value in request_data.get("field_mappings", {}).items():
+            if isinstance(value, dict):
+                field_mappings[key] = FieldMapping(**value)
+            else:
+                field_mappings[key] = value
+        
+        log_quick_extract(execution_id, "processing", "info", "Task details retrieved successfully", {
+            "url": request_data.get("url"),
+            "field_mappings_count": len(field_mappings),
+            "max_items": request_data.get("max_items"),
+            "container_selector": request_data.get("container_selector"),
+            "field_names": list(field_mappings.keys()),
+            "entity_name": request_data.get("entity_name"),
+            "entity_name_type": type(request_data.get("entity_name")).__name__,
+            "entity_name_bool": bool(request_data.get("entity_name")),
+            "source_name": request_data.get("source_name"),
+            "will_store_in_db": bool(request_data.get("entity_name"))
+        })
+        
+        # Reconstruct pagination_config if present
+        pagination_config = None
+        if request_data.get("pagination_config"):
+            print(f"🔍 RAW pagination_config from request_data: {request_data['pagination_config']}")
+            pagination_config = PaginationConfig(**request_data["pagination_config"])
+            print(f"✅ Reconstructed pagination_config: type={pagination_config.type}, start_page={pagination_config.start_page}, max_pages={pagination_config.max_pages}")
+            pagination_details = {
+                "pagination_type": pagination_config.type,
+                "start_page": pagination_config.start_page if hasattr(pagination_config, 'start_page') else 1,
+            }
+            if pagination_config.type == "query_param":
+                pagination_details["param_name"] = pagination_config.param_name
+            elif pagination_config.type == "offset":
+                pagination_details["param_name"] = pagination_config.param_name
+                pagination_details["page_size"] = pagination_config.page_size
+                if hasattr(pagination_config, 'max_pages') and pagination_config.max_pages:
+                    pagination_details["max_pages"] = pagination_config.max_pages
+            elif pagination_config.type == "path":
+                pagination_details["path_pattern"] = pagination_config.path_pattern
+            elif pagination_config.type in ["button_click", "ajax_click"]:
+                pagination_details["button_selector"] = pagination_config.button_selector
+                pagination_details["wait_selector"] = pagination_config.wait_selector
+            elif pagination_config.type == "scroll":
+                pagination_details["scroll_steps"] = pagination_config.scroll_steps
+            
+            log_quick_extract(execution_id, "processing", "info", "Pagination configuration detected", pagination_details)
+        else:
+            log_quick_extract(execution_id, "processing", "info", "No pagination configuration - single page extraction")
+        
+        # Reconstruct captcha_params if present
+        captcha_params = None
+        if request_data.get("captcha_params"):
+            captcha_params = CaptchaParams(**request_data["captcha_params"])
+            log_quick_extract(execution_id, "processing", "info", "Captcha protection detected", {
+                "captcha_type": getattr(captcha_params, 'captcha_type', 'unknown')
+            })
+        
+        # Build ScrapeRequest
+        scrape_request_details = {
+            "entity_name": "quick_extract_task",
+            "has_pagination": pagination_config is not None,
+            "has_captcha": captcha_params is not None,
+            "timeout": request_data.get("timeout", 15),
+            "max_items": request_data.get("max_items")
+        }
+        if pagination_config:
+            scrape_request_details["pagination_type"] = pagination_config.type
+        log_quick_extract(execution_id, "processing", "info", "Building scrape request", scrape_request_details)
+        # Convert follow_links if present
+        follow_links_objects = []
+        if request_data.get("follow_links"):
+            from models import FollowLink
+            for fl_dict in request_data["follow_links"]:
+                if isinstance(fl_dict, dict):
+                    try:
+                        follow_links_objects.append(FollowLink(**fl_dict))
+                    except Exception as e:
+                        log_quick_extract(execution_id, "processing", "warning", f"Invalid follow_link entry: {str(e)}", {"follow_link_dict": fl_dict})
+        
+        scrape_request = ScrapeRequest(
+            entity_name="quick_extract_task",
+            url=HttpUrl(request_data["url"]),
+            container_selector=request_data.get("container_selector"),
+            field_mappings=field_mappings,
+            max_items=request_data.get("max_items"),
+            timeout=request_data.get("timeout", 15),
+            pagination_config=pagination_config,
+            captcha_params=captcha_params,
+            follow_links=follow_links_objects
+        )
+        
+        # Verify pagination_config was set in the request
+        print(f"🔎 ScrapeRequest.pagination_config is None: {scrape_request.pagination_config is None}")
+        if scrape_request.pagination_config:
+            print(f"🔎 ScrapeRequest.pagination_config type: {scrape_request.pagination_config.type}")
+        
+        # Execute scraping
+        scraping_details = {
+            "url": str(request_data["url"]),
+            "timeout": request_data.get("timeout", 15),
+            "max_items": request_data.get("max_items"),
+        }
+        if pagination_config:
+            scraping_details["pagination_enabled"] = True
+            scraping_details["pagination_type"] = pagination_config.type
+            scraping_details["pagination_config_object"] = str(pagination_config)
+        else:
+            scraping_details["pagination_enabled"] = False
+        
+        print(f"📋 Scraping details: {scraping_details}")
+        log_quick_extract(execution_id, "processing", "info", "Starting web scraping", scraping_details)
+        scrape_start = datetime.now()
+        scrape_response = await route_scraping_request(scrape_request)
+        scrape_duration = int((datetime.now() - scrape_start).total_seconds() * 1000)
+        
+        # Log scraping progress
+        log_quick_extract(execution_id, "processing", "info", f"Web scraping completed in {scrape_duration}ms", {
+            "scraping_duration_ms": scrape_duration,
+            "scraping_success": scrape_response.success,
+            "scraping_message": scrape_response.message
+        })
+        
+        execution_duration = int((datetime.now() - execution_start).total_seconds() * 1000)
+        
+        if not scrape_response.success:
+            log_quick_extract(execution_id, "failed", "error", f"Scraping failed: {scrape_response.message}", {
+                "scraping_message": scrape_response.message,
+                "scraping_duration_ms": scrape_duration
+            })
+            result = {
+                "success": False,
+                "status": "failed",
+                "message": scrape_response.message,
+                "execution_id": execution_id,
+                "execution_duration_ms": execution_duration,
+                "data": [],
+                "total_items": 0,
+                "url": str(scrape_response.url),
+                "scraped_at": scrape_response.scraped_at.isoformat()
+            }
+            
+            # Store failed result
+            with quick_extract_lock:
+                quick_extract_results[execution_id] = result
+                logger.info(f"Stored failed quick extract result in memory for execution_id: {execution_id}")
+            
+            # Also store in database
+            try:
+                conn, cur = get_db_cursor()
+                create_quick_extract_results_table(conn)
+                cur.execute("""
+                    INSERT INTO quick_extract_results 
+                    (execution_id, status, success, message, data, total_items, items_scraped, url, scraped_at, execution_duration_ms, error, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (execution_id) 
+                    DO UPDATE SET 
+                        status = EXCLUDED.status,
+                        success = EXCLUDED.success,
+                        message = EXCLUDED.message,
+                        data = EXCLUDED.data,
+                        total_items = EXCLUDED.total_items,
+                        items_scraped = EXCLUDED.items_scraped,
+                        url = EXCLUDED.url,
+                        scraped_at = EXCLUDED.scraped_at,
+                        execution_duration_ms = EXCLUDED.execution_duration_ms,
+                        error = EXCLUDED.error,
+                        updated_at = NOW()
+                """, (
+                    execution_id,
+                    result['status'],
+                    result['success'],
+                    result.get('message'),
+                    json.dumps(result.get('data', [])),
+                    result.get('total_items', 0),
+                    result.get('items_scraped', 0),
+                    result.get('url'),
+                    result.get('scraped_at'),
+                    result.get('execution_duration_ms', 0),
+                    result.get('error')
+                ))
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception as e:
+                logger.error(f"Failed to store failed result in database: {e}")
+        else:
+            items_count = len(scrape_response.data) if scrape_response.data else 0
+            log_quick_extract(execution_id, "processing", "info", "Scraping completed successfully", {
+                "items_scraped": items_count,
+                "total_items_found": scrape_response.total_items,
+                "scraping_duration_ms": scrape_duration,
+                "url": str(scrape_response.url),
+                "scraped_at": scrape_response.scraped_at.isoformat() if scrape_response.scraped_at else None
+            })
+            
+            # Store data in database if entity_name is provided
+            entity_name = request_data.get("entity_name")
+            # Normalize entity_name - strip whitespace and handle empty strings
+            if entity_name:
+                entity_name = str(entity_name).strip()
+                if not entity_name:
+                    entity_name = None
+            
+            source_name = request_data.get("source_name", "Quick Extract")
+            items_stored = 0
+            items_failed = 0
+            upsert_errors = []
+            
+            log_quick_extract(execution_id, "processing", "info", "Checking if data should be stored in database", {
+                "entity_name": entity_name,
+                "entity_name_raw": request_data.get("entity_name"),
+                "entity_name_type": type(entity_name).__name__ if entity_name else "None",
+                "has_entity_name": bool(entity_name),
+                "has_scraped_data": bool(scrape_response.data),
+                "items_count": items_count if scrape_response.data else 0,
+                "will_store": bool(entity_name and scrape_response.data),
+                "source_name": source_name
+            })
+            
+            if entity_name and scrape_response.data:
+                try:
+                    conn, cur = get_db_cursor()
+                    log_quick_extract(execution_id, "processing", "info", f"Retrieving entity table structure for {entity_name}", {
+                        "entity_name": entity_name
+                    })
+                    
+                    # Get entity table structure
+                    # PostgreSQL stores unquoted table names in lowercase, so we need to check both
+                    # First try exact match, then try lowercase
+                    cur.execute("""
+                        SELECT column_name, data_type 
+                        FROM information_schema.columns 
+                        WHERE (table_name = %s OR LOWER(table_name) = LOWER(%s))
+                        AND column_name != 'id'
+                        ORDER BY ordinal_position
+                    """, (entity_name, entity_name))
+                    
+                    table_columns = {row[0]: row[1] for row in cur.fetchall()}
+                    
+                    # If no columns found with case-insensitive match, try to find the actual table name
+                    if not table_columns:
+                        # Try to find the table with case-insensitive search
+                        cur.execute("""
+                            SELECT table_name 
+                            FROM information_schema.tables 
+                            WHERE LOWER(table_name) = LOWER(%s)
+                            AND table_schema = 'public'
+                        """, (entity_name,))
+                        actual_table = cur.fetchone()
+                        if actual_table:
+                            actual_table_name = actual_table[0]
+                            log_quick_extract(execution_id, "processing", "info", f"Found table with different case: '{actual_table_name}' (requested: '{entity_name}')", {
+                                "requested_name": entity_name,
+                                "actual_name": actual_table_name
+                            })
+                            # Retry with actual table name
+                            cur.execute("""
+                                SELECT column_name, data_type 
+                                FROM information_schema.columns 
+                                WHERE table_name = %s 
+                                AND column_name != 'id'
+                                ORDER BY ordinal_position
+                            """, (actual_table_name,))
+                            table_columns = {row[0]: row[1] for row in cur.fetchall()}
+                            entity_name = actual_table_name  # Use the actual table name for upsert
+                    
+                    if not table_columns:
+                        log_quick_extract(execution_id, "processing", "warning", f"Entity table '{entity_name}' not found or has no columns. Data will not be stored.", {
+                            "entity_name": entity_name,
+                            "searched_name": request_data.get("entity_name")
+                        })
+                    else:
+                        log_quick_extract(execution_id, "processing", "info", "Entity table structure retrieved", {
+                            "table_name": entity_name,
+                            "column_count": len(table_columns),
+                            "columns": list(table_columns.keys())
+                        })
+                        
+                        # Insert / Update scraped data in the entity table
+                        log_quick_extract(execution_id, "processing", "info", "Starting to upsert scraped data into database", {
+                            "total_items_to_store": items_count,
+                            "entity_name": entity_name,
+                            "source_name": source_name
+                        })
+                        
+                        # Insert/Update scraped data
+                        for idx, item in enumerate(scrape_response.data):
+                            # Map scraped data to table columns
+                            # Try exact match first, then case-insensitive match
+                            insert_data = {}
+                            for col in table_columns.keys():
+                                # Try exact match
+                                if col in item:
+                                    insert_data[col] = item[col]
+                                else:
+                                    # Try case-insensitive match
+                                    matched_key = None
+                                    for key in item.keys():
+                                        if key.lower() == col.lower():
+                                            matched_key = key
+                                            break
+                                    if matched_key:
+                                        insert_data[col] = item[matched_key]
+                                    else:
+                                        # Column not found in scraped data, set to None
+                                        insert_data[col] = None
+                            
+                            # Log first item for debugging
+                            if idx == 0:
+                                log_quick_extract(execution_id, "processing", "debug", "Mapping scraped data to entity columns", {
+                                    "scraped_data_keys": list(item.keys()),
+                                    "entity_columns": list(table_columns.keys()),
+                                    "mapped_data_keys": list(insert_data.keys()),
+                                    "has_data": any(v is not None for v in insert_data.values())
+                                })
+                            
+                            try:
+                                await upsert_entity_record(cur, entity_name, source_name, insert_data)
+                                items_stored += 1
+                                # Log progress every 5 items for more frequent updates
+                                if (idx + 1) % 5 == 0 or (idx + 1) == items_count:
+                                    log_quick_extract(execution_id, "processing", "debug", f"Upserted {idx + 1}/{items_count} items", {
+                                        "items_stored": items_stored,
+                                        "items_failed": items_failed,
+                                        "progress_percent": round((idx + 1) / items_count * 100, 1) if items_count > 0 else 0
+                                    })
+                            except Exception as e:
+                                items_failed += 1
+                                error_msg = str(e)
+                                upsert_errors.append({'item_index': idx, 'error': error_msg})
+                                # Rollback the connection so subsequent commands (like logging) are allowed
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+                                log_quick_extract(execution_id, "error", "error", f"Error upserting row {idx + 1}: {error_msg}", {
+                                    "item_index": idx,
+                                    "error": error_msg,
+                                    "item_data": {k: str(v)[:100] for k, v in item.items()}
+                                })
+                                continue
+                        
+                        conn.commit()
+                        cur.close()
+                        conn.close()
+                        
+                        log_quick_extract(execution_id, "processing", "info", "Data upsert completed and committed", {
+                            "items_stored": items_stored,
+                            "items_failed": items_failed,
+                            "total_items": items_count,
+                            "success_rate": round((items_stored / items_count * 100), 1) if items_count > 0 else 0,
+                            "entity_name": entity_name
+                        })
+                        
+                        # Verify data was stored by checking the table
+                        if items_stored > 0:
+                            try:
+                                verify_conn, verify_cur = get_db_cursor()
+                                verify_cur.execute(
+                                    sql.SQL("SELECT COUNT(*) FROM {} WHERE source = %s").format(
+                                        sql.Identifier(entity_name)
+                                    ), (source_name,))
+                                stored_count = verify_cur.fetchone()[0]
+                                verify_cur.close()
+                                verify_conn.close()
+                                log_quick_extract(execution_id, "processing", "info", f"Verified {stored_count} records in database for entity '{entity_name}' with source '{source_name}'", {
+                                    "entity_name": entity_name,
+                                    "source_name": source_name,
+                                    "stored_count": stored_count,
+                                    "expected_count": items_stored
+                                })
+                            except Exception as verify_err:
+                                log_quick_extract(execution_id, "processing", "warning", f"Could not verify stored records: {str(verify_err)}", {
+                                    "error": str(verify_err)
+                                })
+                except Exception as e:
+                    log_quick_extract(execution_id, "error", "error", f"Failed to store data in database: {str(e)}", {
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "entity_name": entity_name
+                    }, error_traceback=traceback.format_exc())
+            
+            # Add pagination summary if pagination was used
+            if pagination_config:
+                estimated_pages = None
+                if items_count > 0 and pagination_config.type == "offset" and hasattr(pagination_config, 'page_size') and pagination_config.page_size:
+                    estimated_pages = (items_count // pagination_config.page_size) + (1 if items_count % pagination_config.page_size > 0 else 0)
+                
+                pagination_summary = {
+                    "pagination_type": pagination_config.type,
+                    "items_scraped": items_count,
+                }
+                if estimated_pages:
+                    pagination_summary["estimated_pages_processed"] = estimated_pages
+                
+                log_quick_extract(execution_id, "processing", "info", f"Pagination completed. Scraped {items_count} items across pages.", pagination_summary)
+            
+            completion_message = f"Task execution completed successfully"
+            if entity_name and items_stored > 0:
+                completion_message += f". Stored {items_stored} items in '{entity_name}' table."
+            else:
+                completion_message += f". Scraped {items_count} items."
+            
+            log_quick_extract(execution_id, "completed", "info", completion_message, {
+                "items_scraped": items_count,
+                "items_stored": items_stored if entity_name else 0,
+                "items_failed": items_failed if entity_name else 0,
+                "total_items": scrape_response.total_items,
+                "total_execution_duration_ms": execution_duration,
+                "scraping_duration_ms": scrape_duration,
+                "url": str(scrape_response.url),
+                "entity_name": entity_name,
+                "source_name": source_name if entity_name else None,
+                "success": True
+            }, execution_duration_ms=execution_duration)
+            result = {
+                "success": True,
+                "status": "completed",
+                "message": completion_message,
+                "execution_id": execution_id,
+                "execution_duration_ms": execution_duration,
+                "data": scrape_response.data or [],
+                "total_items": scrape_response.total_items,
+                "url": str(scrape_response.url),
+                "scraped_at": scrape_response.scraped_at.isoformat(),
+                "items_scraped": items_count,
+                "items_stored": items_stored if entity_name else 0,
+                "entity_name": entity_name
+            }
+        
+        # Store result - CRITICAL: Must store before returning
+        # Store in memory
+        with quick_extract_lock:
+            quick_extract_results[execution_id] = result
+            logger.info(f"Stored quick extract result in memory for execution_id: {execution_id}, status: {result['status']}, success: {result['success']}")
+        
+        # Also store in database for cross-process access
+        try:
+            conn, cur = get_db_cursor()
+            create_quick_extract_results_table(conn)
+            cur.execute("""
+                INSERT INTO quick_extract_results 
+                (execution_id, status, success, message, data, total_items, items_scraped, url, scraped_at, execution_duration_ms, error, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (execution_id) 
+                DO UPDATE SET 
+                    status = EXCLUDED.status,
+                    success = EXCLUDED.success,
+                    message = EXCLUDED.message,
+                    data = EXCLUDED.data,
+                    total_items = EXCLUDED.total_items,
+                    items_scraped = EXCLUDED.items_scraped,
+                    url = EXCLUDED.url,
+                    scraped_at = EXCLUDED.scraped_at,
+                    execution_duration_ms = EXCLUDED.execution_duration_ms,
+                    error = EXCLUDED.error,
+                    updated_at = NOW()
+            """, (
+                execution_id,
+                result['status'],
+                result['success'],
+                result.get('message'),
+                json.dumps(result.get('data', [])),
+                result.get('total_items', 0),
+                result.get('items_scraped', 0),
+                result.get('url'),
+                result.get('scraped_at'),
+                result.get('execution_duration_ms', 0),
+                result.get('error')
+            ))
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info(f"Stored quick extract result in database for execution_id: {execution_id}")
+        except Exception as e:
+            logger.error(f"Failed to store result in database: {e}", exc_info=True)
+        
+        return result
+        
+    except Exception as e:
+        error_msg = str(e)
+        execution_duration = int((datetime.now() - execution_start).total_seconds() * 1000)
+        error_traceback = traceback.format_exc()
+        
+        log_quick_extract(execution_id, "failed", "error", f"Quick extract task failed: {error_msg}", {
+            "error": error_msg,
+            "exception_type": type(e).__name__
+        }, error_traceback=error_traceback, execution_duration_ms=execution_duration)
+        
+        result = {
+            "success": False,
+            "status": "failed",
+            "message": f"Quick extract task failed: {error_msg}",
+            "execution_id": execution_id,
+            "execution_duration_ms": execution_duration,
+            "data": [],
+            "total_items": 0,
+            "error": error_msg
+        }
+        
+        with quick_extract_lock:
+            quick_extract_results[execution_id] = result
+            logger.info(f"Stored exception result in memory for execution_id: {execution_id}")
+        
+        # Also store in database
+        try:
+            conn, cur = get_db_cursor()
+            create_quick_extract_results_table(conn)
+            cur.execute("""
+                INSERT INTO quick_extract_results 
+                (execution_id, status, success, message, data, total_items, items_scraped, url, scraped_at, execution_duration_ms, error, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (execution_id) 
+                DO UPDATE SET 
+                    status = EXCLUDED.status,
+                    success = EXCLUDED.success,
+                    message = EXCLUDED.message,
+                    data = EXCLUDED.data,
+                    total_items = EXCLUDED.total_items,
+                    items_scraped = EXCLUDED.items_scraped,
+                    url = EXCLUDED.url,
+                    scraped_at = EXCLUDED.scraped_at,
+                    execution_duration_ms = EXCLUDED.execution_duration_ms,
+                    error = EXCLUDED.error,
+                    updated_at = NOW()
+            """, (
+                execution_id,
+                result['status'],
+                result['success'],
+                result.get('message'),
+                json.dumps(result.get('data', [])),
+                result.get('total_items', 0),
+                result.get('items_scraped', 0),
+                result.get('url'),
+                result.get('scraped_at'),
+                result.get('execution_duration_ms', 0),
+                result.get('error')
+            ))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to store exception result in database: {e}")
+        
+        logger.error(f"Quick extract task {execution_id} failed", exc_info=True)
+        return result
+
+def get_quick_extract_result(execution_id: str) -> Optional[dict]:
+    """
+    Get the result of a quick extract task by execution_id.
+    Returns None if task not found or still processing.
+    First checks memory, then database for cross-process access.
+    """
+    # First check memory
+    with quick_extract_lock:
+        result = quick_extract_results.get(execution_id)
+        if result:
+            logger.debug(f"Found result in memory for execution_id: {execution_id}, status: {result.get('status')}, success: {result.get('success')}")
+            return result
+    
+    # If not in memory, check database (for cross-process access)
+    try:
+        conn, cur = get_db_cursor()
+        create_quick_extract_results_table(conn)
+        cur.execute("""
+            SELECT status, success, message, data, total_items, items_scraped, url, scraped_at, execution_duration_ms, error
+            FROM quick_extract_results
+            WHERE execution_id = %s
+        """, (execution_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if row:
+            # Handle data - PostgreSQL JSONB returns dict/list directly, not string
+            data = row[3] if row[3] else []
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except (json.JSONDecodeError, TypeError):
+                    data = []
+            elif not isinstance(data, (list, dict)):
+                data = []
+            
+            result = {
+                "status": row[0],
+                "success": row[1],
+                "message": row[2],
+                "data": data,
+                "total_items": row[4] or 0,
+                "items_scraped": row[5] or 0,
+                "url": row[6],
+                "scraped_at": row[7].isoformat() if row[7] else None,
+                "execution_duration_ms": row[8] or 0,
+                "error": row[9],
+                "execution_id": execution_id
+            }
+            # Also store in memory for faster access next time
+            with quick_extract_lock:
+                quick_extract_results[execution_id] = result
+            logger.debug(f"Found result in database for execution_id: {execution_id}, status: {result.get('status')}, success: {result.get('success')}")
+            return result
+    except Exception as e:
+        logger.error(f"Error fetching result from database: {e}", exc_info=True)
+    
+    logger.debug(f"No result found for execution_id: {execution_id}")
+    return None
+
+def get_quick_extract_logs(execution_id: str) -> List[dict]:
+    """
+    Get execution logs for a quick extract task by execution_id.
+    Returns empty list if no logs found.
+    First checks database (for cross-process access), then memory.
+    """
+    # First check database (logs are written by worker process, so they're in DB)
+    try:
+        conn, cur = get_db_cursor()
+        create_quick_extract_logs_table(conn)  # This will add missing columns
+        
+        # Check if new columns exist, if not use fallback query
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'quick_extract_logs' AND column_name IN ('error_traceback', 'execution_duration_ms')
+        """)
+        existing_columns = [row[0] for row in cur.fetchall()]
+        has_error_traceback = 'error_traceback' in existing_columns
+        has_execution_duration = 'execution_duration_ms' in existing_columns
+        
+        if has_error_traceback and has_execution_duration:
+            # Use full query with all columns
+            cur.execute("""
+                SELECT status, log_level, message, details, error_traceback, execution_duration_ms, created_at
+                FROM quick_extract_logs
+                WHERE execution_id = %s
+                ORDER BY created_at ASC
+            """, (execution_id,))
+        else:
+            # Fallback query for older table structure
+            cur.execute("""
+                SELECT status, log_level, message, details, created_at
+                FROM quick_extract_logs
+                WHERE execution_id = %s
+                ORDER BY created_at ASC
+            """, (execution_id,))
+        
+        rows = cur.fetchall()
+        logger.debug(f"Fetching logs for execution_id={execution_id}, found {len(rows)} rows")
+        
+        logs = []
+        for row in rows:
+            # Handle details - PostgreSQL JSONB returns dict directly, not string
+            details = row[3] if len(row) > 3 and row[3] else {}
+            if isinstance(details, str):
+                try:
+                    details = json.loads(details)
+                except (json.JSONDecodeError, TypeError):
+                    details = {}
+            elif not isinstance(details, dict):
+                details = {}
+            
+            # Handle different row lengths based on which query was used
+            if len(row) >= 7:
+                # Full query with all columns
+                logs.append({
+                    "execution_id": execution_id,
+                    "status": row[0],
+                    "log_level": row[1],
+                    "message": row[2],
+                    "details": details,
+                    "error_traceback": row[4],
+                    "execution_duration_ms": row[5],
+                    "created_at": row[6].isoformat() if row[6] else None
+                })
+            else:
+                # Fallback query without new columns
+                logs.append({
+                    "execution_id": execution_id,
+                    "status": row[0],
+                    "log_level": row[1],
+                    "message": row[2],
+                    "details": details,
+                    "error_traceback": None,
+                    "execution_duration_ms": None,
+                    "created_at": row[4].isoformat() if len(row) > 4 and row[4] else None
+                })
+        cur.close()
+        conn.close()
+        
+        # Store in memory for faster access
+        if logs:
+            with quick_extract_lock:
+                quick_extract_logs[execution_id] = logs
+            logger.debug(f"Retrieved {len(logs)} logs from database for execution_id={execution_id}")
+        else:
+            logger.debug(f"No logs found in database for execution_id={execution_id}")
+        
+        return logs
+    except Exception as e:
+        logger.error(f"Error fetching logs from database: {e}", exc_info=True)
+        # Fallback to memory if database query fails
+        with quick_extract_lock:
+            logs = quick_extract_logs.get(execution_id, [])
+            return logs

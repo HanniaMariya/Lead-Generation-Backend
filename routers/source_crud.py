@@ -1,13 +1,14 @@
 from fastapi import HTTPException
 from datetime import datetime
 import asyncio
-from models import SourceInfo, SourcesListResponse, PaginationConfig, SourceUpdateRequest, CaptchaParams
+from models import AuthConfig, SourceRequest, SourceInfo, SourcesListResponse, PaginationConfig, SourceUpdateRequest, CaptchaParams
 from utils import extract_value, fetch_page
 import asyncio
 from fastapi import APIRouter
 from routers.get_db_connection import get_db_cursor
 from pydantic import BaseModel
 from psycopg2.extras import Json
+from typing import Optional
 
 router = APIRouter()
 
@@ -20,7 +21,7 @@ async def get_all_sources():
         conn, cur = get_db_cursor()
         #fetch all sources sorted by creation order (id descending for newest first)
         cur.execute("""
-            SELECT id, name, url, pagination_config, is_captcha_protected, captcha_params
+            SELECT id, name, url, pagination_config, is_captcha_protected, captcha_params, auth_config, is_auth_protected
             FROM sources
             ORDER BY id DESC;
         """)
@@ -36,7 +37,9 @@ async def get_all_sources():
                 url=row[2],
                 pagination_config=PaginationConfig(**row[3]) if row[3] else None,
                 is_captcha_protected=row[4],
-                captcha_params=CaptchaParams(**row[5]) if row[5] else None
+                captcha_params=CaptchaParams(**row[5]) if row[5] else None,
+                auth_config=AuthConfig(**row[6]) if row[6] else None,
+                is_auth_protected=row[7]
             ))
 
         return SourcesListResponse(
@@ -48,6 +51,49 @@ async def get_all_sources():
         print(f"Error fetching sources: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch sources: {str(e)}")
 
+@router.get("/scraped-sources", response_model=SourcesListResponse)
+async def get_all_scraped_sources():
+    """
+    Get all saved website sources that have at least one lead associated with them.
+    Uses EXISTS for better performance with large datasets.
+    """
+    try:
+        conn, cur = get_db_cursor()
+        
+        # Using EXISTS is typically faster than COUNT/GROUP BY
+        cur.execute("""
+            SELECT s.id, s.name, s.url
+            FROM sources s
+            WHERE EXISTS (
+                SELECT 1 FROM leads l 
+                WHERE l.source = s.name
+            )
+            ORDER BY s.id DESC;
+        """)
+        
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        # Convert rows into response objects
+        sources = []
+        for row in rows:
+            sources.append(SourceInfo(
+                id=row[0],
+                name=row[1],
+                url=row[2]
+            ))
+
+        return SourcesListResponse(
+            total_sources=len(sources),
+            sources=sources
+        )
+
+    except Exception as e:
+        print(f"Error fetching scraped sources: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch scraped sources: {str(e)}")
+    
+
 @router.get("/source/{source_id}", response_model=SourceInfo)
 async def get_source_by_id(source_id: int):
     """
@@ -56,7 +102,7 @@ async def get_source_by_id(source_id: int):
     try:
         conn, cur = get_db_cursor()
         cur.execute("""
-            SELECT id, name, url, pagination_config, is_captcha_protected, captcha_params
+            SELECT id, name, url, pagination_config, is_captcha_protected, captcha_params, auth_config, is_auth_protected
             FROM sources
             WHERE id = %s;
         """, (source_id,))
@@ -73,7 +119,9 @@ async def get_source_by_id(source_id: int):
             url=row[2],
             pagination_config=PaginationConfig(**row[3]) if row[3] else None,
             is_captcha_protected=row[4],
-            captcha_params=CaptchaParams(**row[5]) if row[5] else None
+            captcha_params=CaptchaParams(**row[5]) if row[5] else None,
+            auth_config=AuthConfig(**row[6]) if row[6] else None,
+            is_auth_protected=row[7]
         )
 
     except HTTPException:
@@ -82,20 +130,13 @@ async def get_source_by_id(source_id: int):
         print(f"Error fetching source: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch source: {str(e)}")
 
-
 @router.post("/save-source", response_model=dict)
-async def save_source(
-    name: str,
-    url: str,
-    pagination_config: PaginationConfig = None,
-    is_captcha_protected: bool = False,
-    captcha_params: CaptchaParams = None
-):
+async def save_source(request: SourceRequest):
     """Save a website source in 'sources' table or reuse if it already exists."""
     conn, cur = get_db_cursor()
     try:
-        name = name.strip()
-        url = url.strip()
+        name = request.name.strip()
+        url = request.url.strip()
 
         if not name or not url:
             raise HTTPException(status_code=400, detail="Source name and URL required.")
@@ -113,14 +154,8 @@ async def save_source(
         """)
 
         # Ensure new columns exist (safe for existing DB)
-        cur.execute("""
-            ALTER TABLE sources 
-            ADD COLUMN IF NOT EXISTS is_captcha_protected BOOLEAN DEFAULT FALSE;
-        """)
-        cur.execute("""
-            ALTER TABLE sources 
-            ADD COLUMN IF NOT EXISTS captcha_params JSONB DEFAULT NULL;
-        """)
+        cur.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS is_auth_protected BOOLEAN DEFAULT FALSE;")
+        cur.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS auth_config JSONB DEFAULT NULL;")
 
         # 2 Check if source already exists
         cur.execute("SELECT id FROM sources WHERE name = %s;", (name,))
@@ -135,16 +170,18 @@ async def save_source(
         # 3 Insert new source
         cur.execute(
             """
-            INSERT INTO sources (name, url, pagination_config, is_captcha_protected, captcha_params)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO sources (name, url, pagination_config, is_captcha_protected, captcha_params, is_auth_protected, auth_config)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING id;
             """,
             (
                 name,
                 url,
-                Json(pagination_config.model_dump() if pagination_config else None),
-                is_captcha_protected,
-                Json(captcha_params.model_dump() if captcha_params else None),
+                Json(request.pagination_config.model_dump() if request.pagination_config else None),
+                request.is_captcha_protected,
+                Json(request.captcha_params.model_dump() if request.captcha_params else None),
+                request.is_auth_protected,
+                Json(request.auth_config.model_dump() if request.auth_config else None)
             )
         )
 
@@ -154,7 +191,7 @@ async def save_source(
         return {
             "success": True,
             "id": new_id,
-            "message": f"Source '{name}' saved successfully."
+            "message": f"Source '{name}' saved successfully. With authentication: {request.is_auth_protected}"
         }
 
     except Exception as e:
@@ -162,7 +199,6 @@ async def save_source(
         raise HTTPException(status_code=500, detail=f"Failed to save source: {str(e)}")
     finally:
         cur.close()
-
 
 @router.put("/source/{source_id}", response_model=dict)
 async def update_source(source_id: int, update_request: SourceUpdateRequest):

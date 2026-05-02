@@ -9,8 +9,28 @@ from kafka import KafkaProducer
 import json
 import os
 import psycopg2
-# BOOTSTRAP = "localhost:9092"
+# Use environment variable for Kafka bootstrap, default to localhost:9092 (for local execution)
+# When running locally, connect to localhost:9092 (the PLAINTEXT_LOCAL listener)
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+
+def get_kafka_config():
+    """Helper to generate Kafka config with SASL_SSL support."""
+    config = {
+        "bootstrap_servers": BOOTSTRAP,
+    }
+    
+    security_protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL")
+    if security_protocol == "SASL_SSL":
+        config.update({
+            "security_protocol": "SASL_SSL",
+            "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "SCRAM-SHA-256"),
+            "sasl_plain_username": os.getenv("KAFKA_SASL_USER"),
+            "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD"),
+            "ssl_cafile": os.getenv("KAFKA_CA_LOCATION"),
+            "ssl_check_hostname": False
+        })
+    return config
+
 DATABASE_URL = os.getenv("DATABASE_URL","postgresql://postgres:9042c98a@localhost:5432/LeadGenerationPro")
 scheduler = BackgroundScheduler()
 producer: KafkaProducer = None  # will initialize in startup
@@ -38,7 +58,7 @@ def enqueue_task(task_id: int, payload: dict = None):
     }
     try:
         future = producer.send('scraping_tasks', message)
-        record_metadata = future.get(timeout=10)
+        record_metadata = future.get(timeout=80)
         print(f"Published task {task_id} to Kafka "
               f"(topic={record_metadata.topic}, partition={record_metadata.partition}, offset={record_metadata.offset})")
     except Exception as e:
@@ -111,10 +131,11 @@ def enqueue_and_reschedule(task_id: int):
 async def task_lifespan(app):
     global producer
     # Initialize Kafka producer on startup
+    kafka_config = get_kafka_config()
     producer = KafkaProducer(
-        bootstrap_servers=BOOTSTRAP,
         value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-        api_version=(2, 6, 0)
+        api_version=(2, 6, 0),
+        **kafka_config
     )
     scheduler.start()
     conn, _ = get_db_cursor()

@@ -1,9 +1,11 @@
-from fastapi import HTTPException, Query
+from fastapi import HTTPException, Query, Body
 from models import EntityRequest,  EntityInfo, EntitiesListResponse
 from psycopg2 import sql
 from fastapi import APIRouter
+from typing import Dict, Any
 import os
 from routers.get_db_connection import get_db_cursor
+from fastapi import Query
 
 router = APIRouter()
 
@@ -103,6 +105,101 @@ async def save_entity(request: EntityRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create entity: {str(e)}")
+
+@router.post("/create-entity-from-fields", response_model=dict)
+async def create_entity_from_fields(payload: Dict[str, Any] = Body(...)):
+    """
+    Create an entity table from field mappings (for quick extract).
+    All fields are created as TEXT type by default.
+    """
+    try:
+        entity_name = payload.get("entity_name", "").strip()
+        field_mappings = payload.get("field_mappings", {})
+        
+        if not entity_name:
+            raise HTTPException(status_code=400, detail="Entity name required.")
+        if not field_mappings:
+            raise HTTPException(status_code=400, detail="Field mappings required.")
+        
+        conn, cur = get_db_cursor()
+        table_name = entity_name.strip().lower().replace(' ', '_')
+        if not table_name:
+            raise HTTPException(status_code=400, detail="Entity name required.")
+        
+        # Check if table already exists
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables WHERE table_name = %s
+            )
+        """, (table_name,))
+        if cur.fetchone()[0]:
+            return {
+                "success": True,
+                "message": f"Entity '{table_name}' already exists.",
+                "entity_name": table_name
+            }
+        
+        # Build columns from field mappings
+        cols = [
+            sql.SQL("id SERIAL PRIMARY KEY"),
+            sql.SQL("modified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            sql.SQL("source TEXT NULL")
+        ]
+        
+        # Add a 'name' column if not present in field mappings
+        has_name = any('name' in key.lower() for key in field_mappings.keys())
+        if not has_name:
+            cols.append(sql.SQL("name TEXT"))
+        
+        # Add columns for each field mapping
+        unique_fields = []
+        for field_name in field_mappings.keys():
+            # Skip if it's a name field and we already added it
+            if 'name' in field_name.lower() and not has_name:
+                continue
+            # Sanitize field name
+            clean_name = field_name.strip().lower().replace(' ', '_').replace('-', '_')
+            # Remove special characters, keep only alphanumeric and underscore
+            clean_name = ''.join(c for c in clean_name if c.isalnum() or c == '_')
+            if clean_name and clean_name not in ['id', 'source', 'modified_at']:
+                cols.append(sql.SQL("{} TEXT").format(sql.Identifier(clean_name)))
+                unique_fields.append(clean_name)
+        
+        # Use name and source for unique constraint if name exists, otherwise use all fields
+        if has_name or 'name' in [f.lower() for f in field_mappings.keys()]:
+            unique_fields = ['name', 'source']
+        else:
+            unique_fields = unique_fields[:5] if len(unique_fields) > 5 else unique_fields  # Limit to 5 fields
+            unique_fields.insert(0, 'source')
+        
+        constraint_name = f"{table_name}_unique_composite_idx"
+        
+        # Create table
+        create_stmt = sql.SQL("""
+            CREATE TABLE IF NOT EXISTS {table} (
+                {fields},
+                CONSTRAINT {constraint} UNIQUE ({unique_fields})
+            );
+        """).format(
+            table=sql.Identifier(table_name),
+            fields=sql.SQL(", ").join(cols),
+            constraint=sql.Identifier(constraint_name),
+            unique_fields=sql.SQL(", ").join([sql.Identifier(f) for f in unique_fields])
+        )
+        
+        cur.execute(create_stmt)
+        conn.commit()
+        cur.close()
+        
+        return {
+            "success": True,
+            "message": f"Entity '{table_name}' created successfully from field mappings.",
+            "entity_name": table_name,
+            "unique_index_fields": unique_fields
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create entity from fields: {str(e)}")
 
     
 @router.put("/edit-entity/{table_name}", response_model=dict)
@@ -299,56 +396,84 @@ async def get_entity_info(table_name: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get entity info: {str(e)}")
 
+
 @router.get("/entities", response_model=EntitiesListResponse)
-async def get_all_entities():
-    """
-    Get all saved entities (tables) with their column information.
-    """
+async def get_all_entities(
+    page: int | None = Query(None, ge=1),
+    page_size: int | None = Query(None, ge=1, le=100)
+):
     try:
         conn, cur = get_db_cursor()
-        
-        
-        # Get all user-created tables (excluding system tables)
+
+        # ---- total count (always)
         cur.execute("""
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'public' 
-            AND table_type = 'BASE TABLE'
-            AND table_name NOT IN ('entity_mappings','sources','tasks')
-            ORDER BY table_name
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_type = 'BASE TABLE'
+              AND table_name NOT IN (
+                'entity_mappings','sources','tasks','quick_extract_results',
+                'quick_extract_logs','task_execution_logs','chat_messages',
+                'chat_sessions','event','user','users','task_logs',
+                'leads','api_sources'
+              )
         """)
-        
+        total_entities = cur.fetchone()[0]
+
+        # ---- base query
+        base_query = """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_type = 'BASE TABLE'
+              AND table_name NOT IN (
+                'entity_mappings','sources','tasks','quick_extract_results',
+                'quick_extract_logs','task_execution_logs','chat_messages',
+                'chat_sessions','event','user','users','task_logs',
+                'leads','api_sources'
+              )
+            ORDER BY table_name
+        """
+
+        params = []
+
+        # ---- optional pagination
+        if page is not None and page_size is not None:
+            offset = (page - 1) * page_size
+            base_query += " LIMIT %s OFFSET %s"
+            params.extend([page_size, offset])
+
+        cur.execute(base_query, params)
         table_names = [row[0] for row in cur.fetchall()]
+
         entities = []
-        
+
         for table_name in table_names:
-            # Get columns for each table
             cur.execute("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = %s 
-                AND table_schema = 'public'
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = %s
                 ORDER BY ordinal_position
             """, (table_name,))
-            
+
             columns = [row[0] for row in cur.fetchall()]
-            
+
             entities.append(EntityInfo(
                 name=table_name,
                 columns=columns
             ))
-        
+
         cur.close()
-        
+
         return EntitiesListResponse(
-            total_entities=len(entities),
+            total_entities=total_entities,
             entities=entities
         )
-        
+
     except Exception as e:
-        print(f"Error fetching entities: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch entities: {str(e)}")
-    
+        print(f"Error fetching entities: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch entities")
 
 @router.get("/entity-data/{table_name}", response_model=dict)
 async def get_entity_data(
@@ -372,6 +497,7 @@ async def get_entity_data(
             SELECT column_name 
             FROM information_schema.columns 
             WHERE table_name = %s
+            ORDER BY ordinal_position
         """, (table_name,))
         columns = [row[0] for row in cur.fetchall()]
         if not columns:
